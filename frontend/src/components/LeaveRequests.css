@@ -1,0 +1,178 @@
+.leave-requests-page {
+  padding: 24px;
+}
+
+.leave-requests-header {
+  margin-bottom: 20px;
+}
+
+.leave-requests-header h2 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.leave-requests-header p {
+  margin: 8px 0 0;
+  color: #4b5563;
+}
+
+.alert {
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 16px;
+}
+
+.alert-success {
+  background: #ecfdf5;
+  color: #065f46;
+  border: 1px solid #a7f3d0;
+}
+
+.alert-error {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.leave-requests-grid {
+  display: grid;
+  gap: 24px;
+  grid-template-columns: minmax(300px, 380px) 1fr;
+}
+
+.leave-form-panel,
+.leave-list-panel {
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  padding: 22px;
+}
+
+.leave-form-panel h3,
+.leave-list-panel h3 {
+  margin: 0 0 16px;
+}
+
+.leave-form label {
+  display: block;
+  margin-bottom: 14px;
+  color: #334155;
+}
+
+.leave-form select,
+.leave-form input,
+.leave-form textarea {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  font-size: 14px;
+}
+
+.leave-form textarea {
+  resize: vertical;
+}
+
+.leave-form .btn {
+  margin-top: 8px;
+}
+
+.leave-list-header {
+  margin-bottom: 12px;
+}
+
+.leave-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+  background: #fafbff;
+}
+
+.leave-card-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.status-badge {
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.status-pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-approved {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.status-cancelled,
+.status-rejected {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.leave-card p {
+  margin: 8px 0;
+  color: #334155;
+}
+
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: #64748b;
+  font-size: 13px;
+  margin-top: 10px;
+}
+
+.leave-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-primary {
+  background-color: #4f46e5;
+  color: white;
+}
+
+.btn-success {
+  background-color: #16a34a;
+  color: white;
+}
+
+.btn-secondary {
+  background-color: #475569;
+  color: white;
+}
+
+.loading-state,
+.empty-state {
+  color: #475569;
+  padding: 24px;
+  text-align: center;
+}
+
+@media (max-width: 960px) {
+  .leave-requests-grid {
+    grid-template-columns: 1fr;
+  }
+}
