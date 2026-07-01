@@ -40,6 +40,8 @@ const LOCAL_INTENT_KEYWORDS = [
   'emergency', 'career', 'growth', 'it support', 'contact',
   // self profile
   'details', 'profile', 'about me', 'basic info',
+  // menu
+  'menu',
 ];
 
 const TYPO_MAP: Record<string, string> = {
@@ -70,9 +72,66 @@ const TYPO_MAP: Record<string, string> = {
 const DRAFT_TTL_MS   = 30 * 60 * 1000; // 30 minutes
 const DRAFT_MAX_SIZE = 500;
 
+// ── Menu system ───────────────────────────────────────────────────────────────
+// Each menu has a title and a list of buttons. A button either opens a submenu
+// (send: 'menu:<name>') or fires an existing command the intents already handle
+// (e.g. send: 'leave balance'). `hrOnly` buttons show only for HR/admin.
+interface MenuButton { label: string; send: string; hrOnly?: boolean }
+interface Menu { title: string; buttons: MenuButton[] }
+
+const MENUS: Record<string, Menu> = {
+  main: {
+    title: 'Main Menu — what would you like to do?',
+    buttons: [
+      { label: 'My Details',         send: 'my details' },
+      { label: 'Leave',              send: 'menu:leave' },
+      { label: 'Company Info',       send: 'menu:company' },
+      { label: 'Documents',          send: 'menu:documents' },
+      { label: 'Employee Directory', send: 'menu:directory', hrOnly: true },
+    ],
+  },
+  leave: {
+    title: 'Leave — choose an option:',
+    buttons: [
+      { label: 'Apply Leave',    send: 'apply leave' },
+      { label: 'Leave Balance',  send: 'leave balance' },
+      { label: 'Leave History',  send: 'my leaves' },
+      { label: 'Cancel Leave',   send: 'cancel leave' },
+      { label: '← Main Menu',    send: 'menu:main' },
+    ],
+  },
+  company: {
+    title: 'Company Info — choose an option:',
+    buttons: [
+      { label: 'Holidays',        send: 'holiday list' },
+      { label: 'Departments',     send: 'department' },
+      { label: 'Designations',    send: 'designation' },
+      { label: 'Office Location', send: 'office location' },
+      { label: 'Company Details', send: 'company info' },
+      { label: '← Main Menu',     send: 'menu:main' },
+    ],
+  },
+  documents: {
+    title: 'Documents — choose an option:',
+    buttons: [
+      { label: 'Form16',       send: 'my form16' },
+      { label: 'Payslip',      send: 'my payslip' },
+      { label: 'Certificates', send: 'my certificates' },
+      { label: '← Main Menu',  send: 'menu:main' },
+    ],
+  },
+  directory: {
+    title: 'Employee Directory — choose an option:',
+    buttons: [
+      { label: 'All Employees',  send: 'all employees' },
+      { label: 'Employee Names', send: 'list employee names' },
+      { label: 'Employee IDs',   send: 'list employee ids' },
+      { label: '← Main Menu',    send: 'menu:main' },
+    ],
+  },
+};
+
 // ── Draft types ───────────────────────────────────────────────────────────────
-// Steps for the guided apply-leave flow. 'ready' means all fields collected and
-// we're showing the draft with Confirm/Cancel.
 type LeaveStep = 'awaiting_start' | 'awaiting_end' | 'awaiting_type' | 'awaiting_reason' | 'ready';
 
 interface LeaveDraft {
@@ -83,7 +142,7 @@ interface LeaveDraft {
   duration: number;
   dayType: string;
   reason: string;
-  step: LeaveStep;   // where we are in the guided flow
+  step: LeaveStep;
 }
 
 interface PartialCancelDraft {
@@ -102,7 +161,7 @@ interface Stamped<T> { data: T; savedAt: number; }
 
 interface IntentCtx {
   message: string;
-  msg: string;         // normalizeText(message) — for typo-tolerant keyword checks
+  msg: string;
   user: Record<string, any>;
   role: string;
   employeeId: string;
@@ -118,21 +177,17 @@ interface IntentCtx {
   directory: { id: string; name: string; code: string }[];
 }
 
-// Action buttons the frontend renders under a bot message. `send` is the text
-// that gets sent to the bot (as if typed) when the button is tapped.
 interface ActionButton {
   label: string;
   send: string;
 }
 
-// A leave-type choice shown as a button (with its balance) during the flow.
 interface LeaveTypeOption {
   code: string;
   name: string;
   balance: number | null;
 }
 
-// An interactive control attached to a bot reply during the guided flow.
 interface ResponseWidget {
   type: 'date' | 'leaveTypes';
   step?: string;
@@ -151,12 +206,31 @@ export class ChatbotService {
   private readonly partialCancelDrafts  = new Map<string, Stamped<PartialCancelDraft>>();
   private readonly cancelChoiceDrafts   = new Map<string, Stamped<CancelChoiceDraft>>();
 
-  // Intent registry — first-match-wins.
+  // Tracks the last menu opened per employee, so buildResponseExtras can attach
+  // that menu's buttons to the reply. Cleared once consumed.
+  private readonly pendingMenu = new Map<string, string>();
+
   private readonly intents: Array<{
     name: string;
     test:   (ctx: IntentCtx) => boolean;
     handle: (ctx: IntentCtx) => Promise<string>;
   }> = [
+    // ── Menu navigation ───────────────────────────────────────────────────────
+    {
+      name: 'menu',
+      test: (ctx) =>
+        /(^|\s)menu:/i.test(ctx.message) || ctx.msg === 'menu' || ctx.msg === 'main menu',
+      handle: async (ctx) => {
+        // Extract the menu name from "menu:leave"; bare "menu" opens main.
+        const m = ctx.message.match(/menu:\s*([a-z]+)/i);
+        const key = m ? m[1].toLowerCase() : 'main';
+        const menu = MENUS[key] ?? MENUS.main;
+        // Remember which menu to render buttons for (consumed in buildResponseExtras).
+        this.pendingMenu.set(ctx.employeeId, MENUS[key] ? key : 'main');
+        return menu.title;
+      },
+    },
+
     // ── Discard an in-progress leave draft (fired by the Cancel button) ───────
     {
       name: 'discardDraft',
@@ -180,7 +254,6 @@ export class ChatbotService {
         ctx.msg.includes('request leave') || ctx.msg.includes('leave request') ||
         ctx.msg === 'apply',
       handle: async (ctx) => {
-        // Begin a fresh guided draft at step 1 (start date).
         this.setDraft(this.leaveDrafts, ctx.employeeId, {
           leaveType: '', leaveDate: '', startDate: '', endDate: '',
           duration: 0, dayType: 'Full Day', reason: '', step: 'awaiting_start',
@@ -188,8 +261,6 @@ export class ChatbotService {
         return `Let's apply for leave. First, please pick your leave start date below.`;
       },
     },
-
-    // ── today / identity / greeting / employeeListShort / myDetails ──
 
     {
       name: 'today',
@@ -351,7 +422,6 @@ export class ChatbotService {
 
     {
       name: 'parseLeave',
-      // Full free-text sentence (power users). Jumps straight to a ready draft.
       test: (ctx) =>
         /(?:\bcl\b|\bel\b|\blop\b|leave type|day type|full day|first half|second half|\btomorrow\b|\btoday\b|\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|\bsaturday\b|\bsunday\b|\bjanuary\b|\bfebruary\b|\bmarch\b|\bapril\b|\bmay\b|\bjune\b|\bjuly\b|\baugust\b|\bseptember\b|\boctober\b|\bnovember\b|\bdecember\b)/i.test(ctx.message) &&
         /\d{1,2}/.test(ctx.message) &&
@@ -683,16 +753,11 @@ export class ChatbotService {
   }
 
   // ── Guided apply-leave flow ────────────────────────────────────────────────
-  // Runs BEFORE the intent registry when the user has a draft mid-flow (any step
-  // other than 'ready'). Interprets the message by the current step and advances.
-  // Returns the reply text, or null if there's no active in-flow draft (so normal
-  // intent handling proceeds).
   private async handleLeaveFlow(ctx: IntentCtx): Promise<string | null> {
     const draft = this.getDraft(this.leaveDrafts, ctx.employeeId);
     if (!draft) return null;
-    if (draft.step === 'ready') return null; // draft complete; let confirm/discard intents handle it
+    if (draft.step === 'ready') return null;
 
-    // Let the user bail out of the flow at any step.
     if (ctx.msg.includes('discard') || ctx.msg === 'cancel' || ctx.msg.includes('cancel leave')) {
       this.deleteDraft(this.leaveDrafts, ctx.employeeId);
       return `No problem — I've cancelled that. Nothing was submitted. Say "Apply leave" to start again.`;
@@ -722,7 +787,6 @@ export class ChatbotService {
     }
 
     if (draft.step === 'awaiting_type') {
-      // Accept a code typed or sent from a button (e.g. "type:CL" or "CL").
       const code = this.extractLeaveTypeCode(ctx.message, ctx.leaveTypes);
       if (!code) return `Please choose a leave type from the buttons below.`;
       draft.leaveType = code;
@@ -732,7 +796,6 @@ export class ChatbotService {
     }
 
     if (draft.step === 'awaiting_reason') {
-      // "skip" leaves reason empty; anything else becomes the reason.
       const reason = ctx.msg === 'skip' || ctx.msg.includes('no reason') ? '' : ctx.message.trim();
       draft.reason = reason;
       draft.step = 'ready';
@@ -744,13 +807,11 @@ export class ChatbotService {
     return null;
   }
 
-  // Pull a YYYY-MM-DD date out of a message (from the date input or typed).
   private extractIsoDate(message: string): string | null {
     const m = String(message || '').match(/(\d{4})-(\d{2})-(\d{2})/);
     return m ? m[0] : null;
   }
 
-  // Resolve a leave-type code from a button payload ("type:CL") or plain text.
   private extractLeaveTypeCode(
     message: string,
     leaveTypes: { code: string }[],
@@ -768,6 +829,11 @@ export class ChatbotService {
     const employeeId: string = user?.employeeId ?? '';
     const rawMsg = message.toLowerCase();
     const msg = this.normalizeMessage(message);
+
+    // Menu commands are always local.
+    if (/(^|\s)menu:/i.test(message) || msg === 'menu' || msg === 'main menu') {
+      return { useLocal: true, reason: 'menu' };
+    }
 
     if (
       this.hasDraft(this.leaveDrafts, employeeId) ||
@@ -823,7 +889,7 @@ export class ChatbotService {
 
     if (useLocal || !this.aiEnabled) {
       const botResponse = await this.generateResponse(message, user);
-      const extras = await this.buildResponseExtras(user.employeeId as string);
+      const extras = await this.buildResponseExtras(user.employeeId as string, user.role as string);
       return {
         success: true,
         userMessage: message,
@@ -838,7 +904,7 @@ export class ChatbotService {
 
     try {
       const botResponse = await this.generateAIResponse(msg, user);
-      const extras = await this.buildResponseExtras(user.employeeId as string);
+      const extras = await this.buildResponseExtras(user.employeeId as string, user.role as string);
       return {
         success: true,
         userMessage: message,
@@ -851,7 +917,7 @@ export class ChatbotService {
       };
     } catch {
       const botResponse = await this.generateResponse(message, user);
-      const extras = await this.buildResponseExtras(user.employeeId as string);
+      const extras = await this.buildResponseExtras(user.employeeId as string, user.role as string);
       return {
         success: true,
         userMessage: message,
@@ -865,11 +931,27 @@ export class ChatbotService {
     }
   }
 
-  // Build the buttons + widget to attach to the current reply, based on the
-  // draft's step. This is what drives the guided UI.
+  // Build the buttons + widget to attach to the current reply.
+  // Priority: a just-opened menu > the guided-flow step.
   private async buildResponseExtras(
     employeeId: string,
+    role: string,
   ): Promise<{ actions: ActionButton[]; widget: ResponseWidget | null }> {
+    // 1) If a menu was just opened, attach its buttons (role-filtered).
+    const menuKey = this.pendingMenu.get(employeeId);
+    if (menuKey) {
+      this.pendingMenu.delete(employeeId);
+      const menu = MENUS[menuKey];
+      if (menu) {
+        const isPrivileged = role === 'admin' || role === 'hr';
+        const actions = menu.buttons
+          .filter(b => !b.hrOnly || isPrivileged)
+          .map(b => ({ label: b.label, send: b.send }));
+        return { actions, widget: null };
+      }
+    }
+
+    // 2) Otherwise fall back to the guided-flow step.
     const draft = this.getDraft(this.leaveDrafts, employeeId);
     if (!draft) return { actions: [], widget: null };
 
@@ -898,7 +980,6 @@ export class ChatbotService {
     return { actions: [], widget: null };
   }
 
-  // Leave-type choices with each type's remaining balance (for the type step).
   private async buildLeaveTypeOptions(employeeId: string): Promise<LeaveTypeOption[]> {
     const types = await this.hrmsDbService.getLeaveTypes();
     const bal = await this.hrmsDbService.getLeaveBalance(employeeId);
@@ -911,6 +992,15 @@ export class ChatbotService {
       name: t.name,
       balance: balByTypeId.has(t.id) ? balByTypeId.get(t.id)! : null,
     }));
+  }
+
+  // Expose the main menu buttons for the frontend's opening menu (role-filtered).
+  getMainMenu(role: string): { title: string; actions: ActionButton[] } {
+    const isPrivileged = role === 'admin' || role === 'hr';
+    const actions = MENUS.main.buttons
+      .filter(b => !b.hrOnly || isPrivileged)
+      .map(b => ({ label: b.label, send: b.send }));
+    return { title: MENUS.main.title, actions };
   }
 
   status() {
@@ -996,7 +1086,6 @@ export class ChatbotService {
       directory,
     };
 
-    // Guided leave flow runs first if a draft is mid-flow.
     const flowReply = await this.handleLeaveFlow(ctx);
     if (flowReply !== null) return flowReply;
 
@@ -1004,7 +1093,7 @@ export class ChatbotService {
       if (intent.test(ctx)) return intent.handle(ctx);
     }
 
-    return `I didn't quite catch that. Try asking something like:\n- "How many leaves do I have left?"\n- "Apply leave"\n- "How do I download Form16?"`;
+    return `I didn't quite catch that. Try the ☰ Menu button, or ask something like:\n- "How many leaves do I have left?"\n- "Apply leave"\n- "How do I download Form16?"`;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1188,7 +1277,7 @@ export class ChatbotService {
   }
 
   private getGeneralHelpGuide(userName: string): string {
-    return `Hi ${userName}. I can answer questions about the portal, company holidays, announcements, office policies, today's date, and more. You can also apply for leave through me — just say "Apply leave".`;
+    return `Hi ${userName}. I can answer questions about the portal, company holidays, announcements, office policies, today's date, and more. You can also apply for leave through me — just say "Apply leave" or use the ☰ Menu.`;
   }
 
   private buildMenuGuide(title: string, steps: string[], footer = ''): string {

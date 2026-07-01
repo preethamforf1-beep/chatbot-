@@ -30,7 +30,7 @@ function getDefaultMessages(user: User | null): ChatMessage[] {
   return [
     {
       id: 1,
-      text: `Hi ${user?.name ?? 'there'}! 👋 I'm your HRMS Assistant. I can help with your personal info, company announcements, portal guidance, today's date, and more. What would you like to know?`,
+      text: `Hi ${user?.name ?? 'there'}! 👋 I'm your HRMS Assistant. Pick an option below, or type your question.`,
       sender: 'bot',
       timestamp: new Date()
     }
@@ -38,26 +38,6 @@ function getDefaultMessages(user: User | null): ChatMessage[] {
 }
 
 export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: ChatbotWidgetProps) {
-  const isPrivileged = user?.role === 'admin' || user?.role === 'hr'
-  const suggestedQuestions = isPrivileged
-    ? [
-        'Show all employees',
-        'How do I view employee private details?',
-        'What is the payroll summary?',
-        'How do I access Form16 for an employee?',
-        'How many leaves are pending?',
-        'How can I approve a leave request?',
-        'What are the company holidays?',
-        "What is today's date?"
-      ]
-    : [
-        'What are my details?',
-        'How many leaves are available?',
-        'Apply leave',
-        'What are the company holidays?',
-        "What is today's date?"
-      ]
-
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const saved = loadWidgetMessages(user)
     return saved ?? getDefaultMessages(user)
@@ -65,6 +45,8 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // Tracks whether we've already auto-shown the main menu this session.
+  const menuShownRef = useRef(false)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -73,25 +55,38 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
   useEffect(() => {
     const saved = loadWidgetMessages(user)
     setMessages(saved ?? getDefaultMessages(user))
+    menuShownRef.current = false
   }, [user?.employeeId, user?.name])
 
-  // Shared send routine used by the input form, action buttons, and widgets.
-  const sendText = async (text: string) => {
+  // Auto-show the main menu the first time the chat is opened for a fresh session
+  // (i.e. only the welcome message is present).
+  useEffect(() => {
+    if (isOpen && !menuShownRef.current && messages.length <= 1 && accessToken) {
+      menuShownRef.current = true
+      void sendText('menu:main', { silent: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, accessToken])
+
+  // Shared send routine. `silent` omits the user bubble (used for menu:main so
+  // the command text doesn't show as if the user typed it).
+  const sendText = async (text: string, opts?: { silent?: boolean }) => {
     const trimmed = text.trim()
     if (!trimmed || loading) return
 
-    const userMessage: ChatMessage = {
-      id: Date.now(),
-      text: trimmed,
-      sender: 'user',
-      timestamp: new Date()
+    if (!opts?.silent) {
+      const userMessage: ChatMessage = {
+        id: Date.now(),
+        text: trimmed,
+        sender: 'user',
+        timestamp: new Date()
+      }
+      setMessages(prev => {
+        const next = [...prev, userMessage]
+        window.localStorage.setItem(getWidgetStorageKey(user), JSON.stringify(next))
+        return next
+      })
     }
-
-    setMessages(prev => {
-      const next = [...prev, userMessage]
-      window.localStorage.setItem(getWidgetStorageKey(user), JSON.stringify(next))
-      return next
-    })
     setLoading(true)
 
     try {
@@ -149,8 +144,11 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
     await sendText(action.send)
   }
 
-  // Only the most recent message's widget is interactive; older ones are frozen
-  // so a user can't re-submit a step they've already passed.
+  const openMainMenu = async () => {
+    setInputValue('')
+    await sendText('menu:main', { silent: true })
+  }
+
   const lastMessageId = messages.length ? messages[messages.length - 1].id : -1
 
   return (
@@ -175,14 +173,13 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
                 <div key={msg.id} className={`message ${msg.sender}`}>
                   <div className="message-bubble">{msg.text}</div>
 
-                  {/* Action buttons (Confirm / Cancel / Skip) */}
                   {msg.sender === 'bot' && msg.actions && msg.actions.length > 0 && (
                     <div className="message-actions">
                       {msg.actions.map((action, i) => (
                         <button
                           key={i}
                           type="button"
-                          className={`message-action-btn ${i > 0 ? 'secondary' : ''}`}
+                          className={`message-action-btn ${action.label.startsWith('←') || action.label.toLowerCase() === 'cancel' || action.label.toLowerCase() === 'skip' ? 'secondary' : ''}`}
                           onClick={() => handleActionClick(action)}
                           disabled={loading || !isLast}
                         >
@@ -192,7 +189,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
                     </div>
                   )}
 
-                  {/* Interactive widget: date picker or leave-type buttons */}
                   {msg.sender === 'bot' && msg.widget && (
                     <ChatWidgetRenderer
                       widget={msg.widget}
@@ -203,24 +199,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
                 </div>
               )
             })}
-
-            {messages.length <= 1 && (
-              <div className="chatbot-suggestions">
-                <p>Try one of these</p>
-                <div className="chatbot-suggestions-grid">
-                  {suggestedQuestions.map((question, index) => (
-                    <button
-                      key={index}
-                      type="button"
-                      className="chatbot-suggestion-btn"
-                      onClick={() => setInputValue(question)}
-                    >
-                      {question}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
 
             {loading && (
               <div className="message bot">
@@ -236,11 +214,20 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
           </div>
 
           <form className="chatbot-input-form" onSubmit={sendMessage}>
+            <button
+              type="button"
+              className="menu-btn"
+              onClick={openMainMenu}
+              disabled={loading}
+              title="Main menu"
+            >
+              ☰
+            </button>
             <input
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Ask about leave requests, approvals, company info, or today's date..."
+              placeholder="Ask a question, or use the menu..."
               disabled={loading}
               className="chatbot-input"
             />
@@ -255,7 +242,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
 }
 
 // ── Widget renderer ───────────────────────────────────────────────────────────
-// Renders the interactive control the bot attached to a message.
 
 interface ChatWidgetRendererProps {
   widget: ChatWidget;
