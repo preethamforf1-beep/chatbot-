@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './ChatbotWidget.css'
-import type { ChatMessage, User } from '../types'
+import type { ChatMessage, ChatAction, ChatWidget, User } from '../types'
 
 interface ChatbotWidgetProps {
   isOpen: boolean;
@@ -53,8 +53,7 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
     : [
         'What are my details?',
         'How many leaves are available?',
-        'Apply CL for 5 July, Full Day',
-        'Cancel my leave',
+        'Apply leave',
         'What are the company holidays?',
         "What is today's date?"
       ]
@@ -76,14 +75,14 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
     setMessages(saved ?? getDefaultMessages(user))
   }, [user?.employeeId, user?.name])
 
-  const sendMessage = async (e: React.FormEvent) => {
-    e.preventDefault()
-
-    if (!inputValue.trim()) return
+  // Shared send routine used by the input form, action buttons, and widgets.
+  const sendText = async (text: string) => {
+    const trimmed = text.trim()
+    if (!trimmed || loading) return
 
     const userMessage: ChatMessage = {
-      id: messages.length + 1,
-      text: inputValue,
+      id: Date.now(),
+      text: trimmed,
       sender: 'user',
       timestamp: new Date()
     }
@@ -93,21 +92,22 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
       window.localStorage.setItem(getWidgetStorageKey(user), JSON.stringify(next))
       return next
     })
-    setInputValue('')
     setLoading(true)
 
     try {
       const response = await axios.post(
         '/api/chatbot/chat',
-        { message: inputValue },
+        { message: trimmed },
         { headers: { Authorization: `Bearer ${accessToken}` } }
       )
 
       const botMessage: ChatMessage = {
-        id: messages.length + 2,
+        id: Date.now() + 1,
         text: response.data.botResponse as string,
         sender: 'bot',
-        timestamp: new Date()
+        timestamp: new Date(),
+        actions: (response.data.actions as ChatAction[] | undefined) ?? [],
+        widget: (response.data.widget as ChatWidget | undefined) ?? undefined
       }
 
       setMessages(prev => {
@@ -122,7 +122,7 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
         : 'Sorry, I encountered an error. Please try again.'
 
       const errorMessage: ChatMessage = {
-        id: messages.length + 2,
+        id: Date.now() + 1,
         text: errText + (detail ? ` (${detail})` : ''),
         sender: 'bot',
         timestamp: new Date()
@@ -136,6 +136,22 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
       setLoading(false)
     }
   }
+
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const toSend = inputValue
+    setInputValue('')
+    await sendText(toSend)
+  }
+
+  const handleActionClick = async (action: ChatAction) => {
+    setInputValue('')
+    await sendText(action.send)
+  }
+
+  // Only the most recent message's widget is interactive; older ones are frozen
+  // so a user can't re-submit a step they've already passed.
+  const lastMessageId = messages.length ? messages[messages.length - 1].id : -1
 
   return (
     <>
@@ -153,11 +169,40 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
           </div>
 
           <div className="chatbot-messages">
-            {messages.map(msg => (
-              <div key={msg.id} className={`message ${msg.sender}`}>
-                <div className="message-bubble">{msg.text}</div>
-              </div>
-            ))}
+            {messages.map(msg => {
+              const isLast = msg.id === lastMessageId
+              return (
+                <div key={msg.id} className={`message ${msg.sender}`}>
+                  <div className="message-bubble">{msg.text}</div>
+
+                  {/* Action buttons (Confirm / Cancel / Skip) */}
+                  {msg.sender === 'bot' && msg.actions && msg.actions.length > 0 && (
+                    <div className="message-actions">
+                      {msg.actions.map((action, i) => (
+                        <button
+                          key={i}
+                          type="button"
+                          className={`message-action-btn ${i > 0 ? 'secondary' : ''}`}
+                          onClick={() => handleActionClick(action)}
+                          disabled={loading || !isLast}
+                        >
+                          {action.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Interactive widget: date picker or leave-type buttons */}
+                  {msg.sender === 'bot' && msg.widget && (
+                    <ChatWidgetRenderer
+                      widget={msg.widget}
+                      disabled={loading || !isLast}
+                      onSubmit={sendText}
+                    />
+                  )}
+                </div>
+              )
+            })}
 
             {messages.length <= 1 && (
               <div className="chatbot-suggestions">
@@ -207,4 +252,64 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
       )}
     </>
   )
+}
+
+// ── Widget renderer ───────────────────────────────────────────────────────────
+// Renders the interactive control the bot attached to a message.
+
+interface ChatWidgetRendererProps {
+  widget: ChatWidget;
+  disabled: boolean;
+  onSubmit: (text: string) => void;
+}
+
+function ChatWidgetRenderer({ widget, disabled, onSubmit }: ChatWidgetRendererProps) {
+  const [dateValue, setDateValue] = useState('')
+
+  if (widget.type === 'date') {
+    return (
+      <div className="chat-date-picker">
+        <input
+          type="date"
+          className="chat-date-input"
+          value={dateValue}
+          min={widget.minDate}
+          disabled={disabled}
+          onChange={(e) => setDateValue(e.target.value)}
+        />
+        <button
+          type="button"
+          className="chat-date-submit"
+          disabled={disabled || !dateValue}
+          onClick={() => onSubmit(dateValue)}
+        >
+          Set date
+        </button>
+      </div>
+    )
+  }
+
+  if (widget.type === 'leaveTypes') {
+    const options = widget.options ?? []
+    return (
+      <div className="leave-type-grid">
+        {options.map((opt, i) => (
+          <button
+            key={i}
+            type="button"
+            className="leave-type-btn"
+            disabled={disabled}
+            onClick={() => onSubmit(`type:${opt.code}`)}
+          >
+            <span className="leave-type-name">{opt.name} ({opt.code})</span>
+            <span className={`leave-type-balance ${opt.balance === null || opt.balance <= 0 ? 'zero' : ''}`}>
+              {opt.balance === null ? 'no balance set' : `${opt.balance} left`}
+            </span>
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  return null
 }

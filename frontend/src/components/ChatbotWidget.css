@@ -311,6 +311,151 @@
   background: #999;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Guided leave flow: action buttons, leave-type choices, date input
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Let a bot message stack its bubble + controls vertically, aligned left.
+   (.message is a flex row by default, which would put controls beside the
+   bubble — this overrides that for bot messages.) */
+.message.bot {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* Confirm / Cancel (and other action) buttons under a bot message */
+.message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.message-action-btn {
+  padding: 8px 16px;
+  border: 1px solid #667eea;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.message-action-btn:hover:not(:disabled) {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+/* Secondary style for the last button (Cancel / Skip) */
+.message-action-btn.secondary {
+  background: #fff;
+  color: #667eea;
+}
+
+.message-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Leave-type choice buttons (each shows a balance) */
+.leave-type-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  width: 100%;
+}
+
+.leave-type-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid #d8dff5;
+  background: #fff;
+  color: #333;
+  border-radius: 10px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: left;
+}
+
+.leave-type-btn:hover:not(:disabled) {
+  background: #eef2ff;
+  border-color: #a5b4fc;
+  transform: translateY(-1px);
+}
+
+.leave-type-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.leave-type-name {
+  font-weight: 600;
+  color: #4f46e5;
+}
+
+.leave-type-balance {
+  font-size: 12px;
+  font-weight: 600;
+  color: #059669;
+  white-space: nowrap;
+}
+
+.leave-type-balance.zero {
+  color: #9ca3af;
+}
+
+/* In-chat date picker */
+.chat-date-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  align-items: center;
+}
+
+.chat-date-input {
+  padding: 9px 12px;
+  border: 1px solid #d8dff5;
+  border-radius: 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #333;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.chat-date-input:focus {
+  border-color: #667eea;
+}
+
+.chat-date-submit {
+  padding: 9px 16px;
+  border: none;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.chat-date-submit:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.chat-date-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Mobile Responsive */
 @media (max-width: 600px) {
   .chatbot-widget {

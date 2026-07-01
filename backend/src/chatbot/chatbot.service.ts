@@ -19,7 +19,7 @@ const PERSONAL_INFO_KEYWORDS = [
   'my credential', 'my skill',
 ];
 
-const LEAVE_ACTION_TRIGGERS = ['leave', 'cancel', 'confirm', 'apply'];
+const LEAVE_ACTION_TRIGGERS = ['leave', 'cancel', 'confirm', 'apply', 'discard'];
 
 // Keywords that map to a known rule-based intent. Any message containing one of these
 // is answered locally instead of being sent to the LLM. (Edit here to extend.)
@@ -71,6 +71,10 @@ const DRAFT_TTL_MS   = 30 * 60 * 1000; // 30 minutes
 const DRAFT_MAX_SIZE = 500;
 
 // ── Draft types ───────────────────────────────────────────────────────────────
+// Steps for the guided apply-leave flow. 'ready' means all fields collected and
+// we're showing the draft with Confirm/Cancel.
+type LeaveStep = 'awaiting_start' | 'awaiting_end' | 'awaiting_type' | 'awaiting_reason' | 'ready';
+
 interface LeaveDraft {
   leaveType: string;
   leaveDate: string;
@@ -79,6 +83,7 @@ interface LeaveDraft {
   duration: number;
   dayType: string;
   reason: string;
+  step: LeaveStep;   // where we are in the guided flow
 }
 
 interface PartialCancelDraft {
@@ -113,6 +118,28 @@ interface IntentCtx {
   directory: { id: string; name: string; code: string }[];
 }
 
+// Action buttons the frontend renders under a bot message. `send` is the text
+// that gets sent to the bot (as if typed) when the button is tapped.
+interface ActionButton {
+  label: string;
+  send: string;
+}
+
+// A leave-type choice shown as a button (with its balance) during the flow.
+interface LeaveTypeOption {
+  code: string;
+  name: string;
+  balance: number | null;
+}
+
+// An interactive control attached to a bot reply during the guided flow.
+interface ResponseWidget {
+  type: 'date' | 'leaveTypes';
+  step?: string;
+  minDate?: string;
+  options?: LeaveTypeOption[];
+}
+
 @Injectable()
 export class ChatbotService {
   private readonly aiClient?: OpenAI;
@@ -124,14 +151,45 @@ export class ChatbotService {
   private readonly partialCancelDrafts  = new Map<string, Stamped<PartialCancelDraft>>();
   private readonly cancelChoiceDrafts   = new Map<string, Stamped<CancelChoiceDraft>>();
 
-  // Intent registry — first-match-wins. Intents are ported here from the if/else
-  // chain in generateResponse. The legacy path shrinks as each batch is moved.
+  // Intent registry — first-match-wins.
   private readonly intents: Array<{
     name: string;
     test:   (ctx: IntentCtx) => boolean;
     handle: (ctx: IntentCtx) => Promise<string>;
   }> = [
-    // ── Batch 1: today / identity / greeting / employeeListShort / myDetails ──
+    // ── Discard an in-progress leave draft (fired by the Cancel button) ───────
+    {
+      name: 'discardDraft',
+      test: (ctx) =>
+        ctx.msg.includes('discard leave draft') || ctx.msg.includes('discard draft') ||
+        ctx.msg.includes('discard leave'),
+      handle: async (ctx) => {
+        const had = this.hasDraft(this.leaveDrafts, ctx.employeeId);
+        this.deleteDraft(this.leaveDrafts, ctx.employeeId);
+        return had
+          ? `No problem — I've discarded that leave request. Nothing was submitted. You can start a new one anytime by saying "Apply leave".`
+          : `There's no pending leave request to discard. Say "Apply leave" to start one.`;
+      },
+    },
+
+    // ── Start the guided apply-leave flow ─────────────────────────────────────
+    {
+      name: 'applyLeave',
+      test: (ctx) =>
+        ctx.msg.includes('apply leave') || ctx.msg.includes('apply for leave') ||
+        ctx.msg.includes('request leave') || ctx.msg.includes('leave request') ||
+        ctx.msg === 'apply',
+      handle: async (ctx) => {
+        // Begin a fresh guided draft at step 1 (start date).
+        this.setDraft(this.leaveDrafts, ctx.employeeId, {
+          leaveType: '', leaveDate: '', startDate: '', endDate: '',
+          duration: 0, dayType: 'Full Day', reason: '', step: 'awaiting_start',
+        });
+        return `Let's apply for leave. First, please pick your leave start date below.`;
+      },
+    },
+
+    // ── today / identity / greeting / employeeListShort / myDetails ──
 
     {
       name: 'today',
@@ -149,7 +207,6 @@ export class ChatbotService {
 
     {
       name: 'greeting',
-      // hi/hey/hello matched as WHOLE WORDS so "history", "high", "shed" etc. don't trigger it.
       test: (ctx) =>
         /\b(hi|hey|hello|hii|heyy)\b/.test(ctx.msg) ||
         ctx.msg.includes('good morning') || ctx.msg.includes('good afternoon') || ctx.msg.includes('good evening'),
@@ -193,7 +250,6 @@ export class ChatbotService {
       handle: async (ctx) => {
         if (!ctx.selfEmployee) return 'Employee data not found.';
         const e = ctx.selfEmployee;
-        // Targeted single-field answers
         if ((ctx.msg.includes('role') || ctx.msg.includes('designation')) && !ctx.msg.includes('detail') && !ctx.msg.includes('profile')) {
           return `Your designation is ${e.designation}.`;
         }
@@ -222,7 +278,7 @@ export class ChatbotService {
       handle: async (ctx) => {
         const history = await this.hrmsDbService.getLeaveHistory(ctx.employeeId);
         if (!history.length) {
-          return `You have no leave requests on record. To apply, say e.g. "Apply CL for 15 July to 17 July".`;
+          return `You have no leave requests on record. To apply, say "Apply leave".`;
         }
         const lines = history.map((h, i) =>
           `${i + 1}. ${h.leaveType} — ${this.formatLeaveRange(h.fromDate, h.toDate)} (${this.formatDayCount(h.noOfDays)}) — ${h.status}`,
@@ -230,8 +286,6 @@ export class ChatbotService {
         return `Your leave requests:\n${lines.join('\n')}`;
       },
     },
-
-    // ── Batch 2: salaryHistory / mySalary / confirmLeave / parseLeave / applyLeave ──
 
     {
       name: 'salaryHistory',
@@ -273,12 +327,12 @@ export class ChatbotService {
       handle: async (ctx) => {
         const draft = this.getDraft(this.leaveDrafts, ctx.employeeId);
         if (!draft) {
-          return `I don't have your leave details yet. Please provide your leave request details first, for example: "Apply CL for 15 June to 17 June, reason: personal work."`;
+          return `I don't have your leave details yet. Say "Apply leave" to start.`;
         }
         const leaveTypeId = this.resolveLeaveTypeId(draft.leaveType, ctx.leaveTypes);
         if (!leaveTypeId) {
           this.deleteDraft(this.leaveDrafts, ctx.employeeId);
-          return `I couldn't recognise the leave type "${draft.leaveType}". Please use a valid code: CL, SL, EL, ML, PL, CO, LOP, MRL, BL, or WFH.`;
+          return `I couldn't recognise the leave type "${draft.leaveType}". Please start again with "Apply leave".`;
         }
         const result = await this.hrmsDbService.createLeaveRequest(ctx.employeeId, {
           leaveTypeId,
@@ -291,38 +345,25 @@ export class ChatbotService {
           const rangeText = this.formatLeaveRange(draft.startDate, draft.endDate);
           return `${result.message}\n- Type: ${draft.leaveType}\n- Dates: ${rangeText}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nUse "my leaves" to see all your leave requests.`;
         }
-        // Proc returned a 400/404/409 (e.g. insufficient balance, overlapping leave)
         return result.message;
       },
     },
 
     {
       name: 'parseLeave',
-      // Test uses raw message for date/type detection; parseLeaveMessage is called in both
-      // test and handle — cost is acceptable since it only fires when regex pre-filters match.
+      // Full free-text sentence (power users). Jumps straight to a ready draft.
       test: (ctx) =>
         /(?:\bcl\b|\bel\b|\blop\b|leave type|day type|full day|first half|second half|\btomorrow\b|\btoday\b|\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b|\bsaturday\b|\bsunday\b|\bjanuary\b|\bfebruary\b|\bmarch\b|\bapril\b|\bmay\b|\bjune\b|\bjuly\b|\baugust\b|\bseptember\b|\boctober\b|\bnovember\b|\bdecember\b)/i.test(ctx.message) &&
         /\d{1,2}/.test(ctx.message) &&
         this.parseLeaveMessage(ctx.message) !== null,
       handle: async (ctx) => {
         const parsed = this.parseLeaveMessage(ctx.message)!;
-        this.setDraft(this.leaveDrafts, ctx.employeeId, parsed);
+        this.setDraft(this.leaveDrafts, ctx.employeeId, { ...parsed, step: 'ready' });
         const rangeText    = this.formatLeaveRange(parsed.startDate, parsed.endDate);
         const durationText = this.formatDayCount(parsed.duration);
-        return `Great! I found your leave details:\n- Type: ${parsed.leaveType}\n- Dates: ${rangeText} (${durationText})\n- Day type: ${parsed.dayType}${parsed.reason ? `\n- Reason: ${parsed.reason}` : ''}\n\nReply "Confirm leave" to submit this request, or revise the details if needed.`;
+        return `Great! I found your leave details:\n- Type: ${parsed.leaveType}\n- Dates: ${rangeText} (${durationText})\n- Day type: ${parsed.dayType}${parsed.reason ? `\n- Reason: ${parsed.reason}` : ''}\n\nTap "Confirm Leave" to submit, or "Cancel" to discard.`;
       },
     },
-
-    {
-      name: 'applyLeave',
-      test: (ctx) =>
-        ctx.msg.includes('apply leave') || ctx.msg.includes('apply for leave') ||
-        ctx.msg.includes('request leave') || ctx.msg.includes('leave request'),
-      handle: async (_ctx) =>
-        `Sure — I can help you apply for leave.\n\nPlease send these details:\n- Leave type code: CL / SL / EL / ML / PL / CO / LOP / MRL / BL / WFH\n- Date or date range: 15 July or 15 July to 17 July\n- Reason: optional\n\nExample: "Apply CL for 15 July to 17 July, reason: personal work".`,
-    },
-
-    // ── Batch 3: cancelHelp / confirmCancelNoDraft / cancelChoiceDraft / partialCancel* ──
 
     {
       name: 'cancelHelp',
@@ -334,17 +375,12 @@ export class ChatbotService {
         `Leave cancellation through the assistant is coming soon. For now, you can view your leave requests with "my leaves", and cancel a request from the Leave Requests page in the portal.`,
     },
 
-                    // ── Batch 4: partialCancelRequest / cancelEntire / approveLeave / leaveBalance / myForm16 ──
-
-        {
+    {
       name: 'cancelEntire',
       test: (ctx) =>
         ctx.msg.includes('cancel leave') || ctx.msg.includes('cancel my leave') ||
         ctx.msg.includes('cancel request') || ctx.msg.includes('withdraw leave'),
       handle: async (ctx) => {
-        // Cancellation/withdrawal procedure is not available in HRMSDEV yet.
-        // Show the user's leaves so the groundwork is ready; actual cancel wires in
-        // once the team delivers the withdrawal USP.
         const history = await this.hrmsDbService.getLeaveHistory(ctx.employeeId);
         if (!history.length) {
           return `You have no leave requests on record.`;
@@ -364,7 +400,7 @@ export class ChatbotService {
       handle: async (ctx) =>
         (ctx.role === 'admin' || ctx.role === 'hr')
           ? `As HR/Admin, you can review pending leave requests on the Leave Requests page. Select a pending request and click Approve when ready.`
-          : `Only HR/Admin can approve leave requests. If you want to cancel a pending request before approval, reply "Cancel leave" or use the Leave Requests page.`,
+          : `Only HR/Admin can approve leave requests. If you want to cancel a pending request before approval, use the Leave Requests page.`,
     },
 
     {
@@ -393,8 +429,6 @@ export class ChatbotService {
             ])
           : 'Form16 not available. Contact Finance team.',
     },
-
-    // ── Batch 5: listEmployeeNames / listEmployeeIds / myCertificates / privateDocs / allEmployees ──
 
     {
       name: 'listEmployeeNames',
@@ -464,8 +498,6 @@ export class ChatbotService {
       },
     },
 
-    // ── Batch 6: salaryNotMine / employeeDetail / facility one-liners ──────────
-
     {
       name: 'salaryNotMine',
       test: (ctx) => (this.fuzzyContains(ctx.msg, 'salary') || ctx.msg.includes('pay')) && !ctx.msg.includes('my'),
@@ -495,7 +527,7 @@ export class ChatbotService {
           : `You can only access your own details. Use "my details" to view yours.\n\n${this.getOwnProfileGuide(ctx.selfEmployee ?? { name: ctx.name, department: 'N/A', designation: 'Employee' })}`,
     },
 
-        {
+    {
       name: 'officeLocation',
       test: (ctx) =>
         (ctx.msg.includes('office') || ctx.msg.includes('branch')) &&
@@ -510,13 +542,8 @@ export class ChatbotService {
       },
     },
 
-                    // ── Batch 7: holidays / announcements / policy / wfh / dressCode / training / itContact / career ──
-
     {
       name: 'holidays',
-      // 'off' must be matched as a whole word (\boff\b) so it catches "day off" / "time off"
-      // but NOT "office", "offer", "coffee", etc. Bare includes('off') wrongly hijacked
-      // "office hours" into the holidays intent.
       test: (ctx) =>
         this.fuzzyContains(ctx.msg, 'holiday') || ctx.msg.includes('vacation') ||
         /\boff\b/.test(ctx.msg) || ctx.msg.includes('festive'),
@@ -554,11 +581,7 @@ export class ChatbotService {
       },
     },
 
-                        // ── Batch 8 (final): team / department / birthday / emergency / performance /
-    //                     probation / officeHours / attendance / benefits /
-    //                     portalGuide / itSupport / thankYou ──────────────────────
-
-        {
+    {
       name: 'designation',
       test: (ctx) =>
         ctx.msg.includes('designation') || ctx.msg.includes('job title') ||
@@ -598,7 +621,7 @@ export class ChatbotService {
       },
     },
 
-                                        {
+    {
       name: 'thankYou',
       test: (ctx) =>
         ctx.msg.includes('thank') || ctx.msg.includes('thanks') || ctx.msg.includes('appreciate'),
@@ -655,14 +678,95 @@ export class ChatbotService {
     map.delete(key);
   }
 
+  hasLeaveDraft(employeeId: string): boolean {
+    return this.hasDraft(this.leaveDrafts, employeeId);
+  }
+
+  // ── Guided apply-leave flow ────────────────────────────────────────────────
+  // Runs BEFORE the intent registry when the user has a draft mid-flow (any step
+  // other than 'ready'). Interprets the message by the current step and advances.
+  // Returns the reply text, or null if there's no active in-flow draft (so normal
+  // intent handling proceeds).
+  private async handleLeaveFlow(ctx: IntentCtx): Promise<string | null> {
+    const draft = this.getDraft(this.leaveDrafts, ctx.employeeId);
+    if (!draft) return null;
+    if (draft.step === 'ready') return null; // draft complete; let confirm/discard intents handle it
+
+    // Let the user bail out of the flow at any step.
+    if (ctx.msg.includes('discard') || ctx.msg === 'cancel' || ctx.msg.includes('cancel leave')) {
+      this.deleteDraft(this.leaveDrafts, ctx.employeeId);
+      return `No problem — I've cancelled that. Nothing was submitted. Say "Apply leave" to start again.`;
+    }
+
+    const iso = this.extractIsoDate(ctx.message);
+
+    if (draft.step === 'awaiting_start') {
+      if (!iso) return `Please pick your leave start date below (or type it as YYYY-MM-DD).`;
+      draft.startDate = iso;
+      draft.leaveDate = iso;
+      draft.step = 'awaiting_end';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      return `Start date set to ${iso}. Now pick your end date (same as start for a single day).`;
+    }
+
+    if (draft.step === 'awaiting_end') {
+      if (!iso) return `Please pick your leave end date below (or type it as YYYY-MM-DD).`;
+      if (iso < draft.startDate) {
+        return `The end date can't be before the start date (${draft.startDate}). Please pick a later date.`;
+      }
+      draft.endDate = iso;
+      draft.duration = Math.floor((new Date(iso).getTime() - new Date(draft.startDate).getTime()) / 86400000) + 1;
+      draft.step = 'awaiting_type';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      return `End date set to ${iso} (${this.formatDayCount(draft.duration)}). Now choose your leave type below.`;
+    }
+
+    if (draft.step === 'awaiting_type') {
+      // Accept a code typed or sent from a button (e.g. "type:CL" or "CL").
+      const code = this.extractLeaveTypeCode(ctx.message, ctx.leaveTypes);
+      if (!code) return `Please choose a leave type from the buttons below.`;
+      draft.leaveType = code;
+      draft.step = 'awaiting_reason';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      return `Leave type set to ${code}. Finally, add a reason (or tap Skip).`;
+    }
+
+    if (draft.step === 'awaiting_reason') {
+      // "skip" leaves reason empty; anything else becomes the reason.
+      const reason = ctx.msg === 'skip' || ctx.msg.includes('no reason') ? '' : ctx.message.trim();
+      draft.reason = reason;
+      draft.step = 'ready';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      const rangeText = this.formatLeaveRange(draft.startDate, draft.endDate);
+      return `Here's your leave request:\n- Type: ${draft.leaveType}\n- Dates: ${rangeText} (${this.formatDayCount(draft.duration)})\n- Day type: ${draft.dayType}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nTap "Confirm Leave" to submit, or "Cancel" to discard.`;
+    }
+
+    return null;
+  }
+
+  // Pull a YYYY-MM-DD date out of a message (from the date input or typed).
+  private extractIsoDate(message: string): string | null {
+    const m = String(message || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+    return m ? m[0] : null;
+  }
+
+  // Resolve a leave-type code from a button payload ("type:CL") or plain text.
+  private extractLeaveTypeCode(
+    message: string,
+    leaveTypes: { code: string }[],
+  ): string | null {
+    const raw = String(message || '').trim();
+    const tagged = raw.match(/type:\s*([A-Za-z]+)/i);
+    const candidate = (tagged ? tagged[1] : raw).toUpperCase();
+    const match = leaveTypes.find(t => (t.code ?? '').toUpperCase() === candidate);
+    return match ? match.code.toUpperCase() : null;
+  }
+
   // ── Routing ───────────────────────────────────────────────────────────────
 
   classifyRoute(message: string, user: Record<string, any>): { useLocal: boolean; reason: string } {
     const employeeId: string = user?.employeeId ?? '';
-    // rawMsg: use for exact keyword matching (normalizeMessage fuzzy-corrects short words
-    // like "the" → "tax" which causes false positives in payroll/PII checks).
     const rawMsg = message.toLowerCase();
-    // msg: normalised for leave/personal checks where typo correction helps.
     const msg = this.normalizeMessage(message);
 
     if (
@@ -692,15 +796,10 @@ export class ChatbotService {
       return { useLocal: true, reason: 'personal_info' };
     }
 
-    // Known local intents (date, holidays, company info, policies, office facilities,
-    // greetings, etc.) must be answered by the rule engine — NOT the LLM. Without this,
-    // questions like "what is today's date" or "holiday list" fall through to the AI,
-    // which invents vague answers. Keep them local.
     if (LOCAL_INTENT_KEYWORDS.some(k => msg.includes(k))) {
       return { useLocal: true, reason: 'known_local_intent' };
     }
 
-    // Fail safe: single unrecognised token → never send to LLM
     if (rawMsg.trim().split(/\s+/).filter(Boolean).length === 1) {
       return { useLocal: true, reason: 'ambiguous_single_token' };
     }
@@ -713,7 +812,6 @@ export class ChatbotService {
   async chat(message: string, userPayload?: Record<string, any>) {
     if (!message?.trim()) throw new BadRequestException('message is required');
 
-    // TEMPORARY for HRMSDEV testing — remove when real login is wired
     const user = userPayload ?? {
       employeeId: '284512',
       name: 'Test User',
@@ -725,10 +823,13 @@ export class ChatbotService {
 
     if (useLocal || !this.aiEnabled) {
       const botResponse = await this.generateResponse(message, user);
+      const extras = await this.buildResponseExtras(user.employeeId as string);
       return {
         success: true,
         userMessage: message,
         botResponse,
+        actions: extras.actions,
+        widget: extras.widget,
         confidence: 'LOCAL',
         timestamp: new Date(),
         user: { name: user.name, role: user.role },
@@ -737,25 +838,79 @@ export class ChatbotService {
 
     try {
       const botResponse = await this.generateAIResponse(msg, user);
+      const extras = await this.buildResponseExtras(user.employeeId as string);
       return {
         success: true,
         userMessage: message,
         botResponse,
+        actions: extras.actions,
+        widget: extras.widget,
         confidence: 'AI',
         timestamp: new Date(),
         user: { name: user.name, role: user.role },
       };
     } catch {
       const botResponse = await this.generateResponse(message, user);
+      const extras = await this.buildResponseExtras(user.employeeId as string);
       return {
         success: true,
         userMessage: message,
         botResponse,
+        actions: extras.actions,
+        widget: extras.widget,
         confidence: 'FALLBACK',
         timestamp: new Date(),
         user: { name: user.name, role: user.role },
       };
     }
+  }
+
+  // Build the buttons + widget to attach to the current reply, based on the
+  // draft's step. This is what drives the guided UI.
+  private async buildResponseExtras(
+    employeeId: string,
+  ): Promise<{ actions: ActionButton[]; widget: ResponseWidget | null }> {
+    const draft = this.getDraft(this.leaveDrafts, employeeId);
+    if (!draft) return { actions: [], widget: null };
+
+    if (draft.step === 'awaiting_start') {
+      return { actions: [], widget: { type: 'date', step: 'start' } };
+    }
+    if (draft.step === 'awaiting_end') {
+      return { actions: [], widget: { type: 'date', step: 'end', minDate: draft.startDate } };
+    }
+    if (draft.step === 'awaiting_type') {
+      const options = await this.buildLeaveTypeOptions(employeeId);
+      return { actions: [], widget: { type: 'leaveTypes', step: 'type', options } };
+    }
+    if (draft.step === 'awaiting_reason') {
+      return { actions: [{ label: 'Skip', send: 'skip' }], widget: null };
+    }
+    if (draft.step === 'ready') {
+      return {
+        actions: [
+          { label: 'Confirm Leave', send: 'confirm leave' },
+          { label: 'Cancel', send: 'discard leave draft' },
+        ],
+        widget: null,
+      };
+    }
+    return { actions: [], widget: null };
+  }
+
+  // Leave-type choices with each type's remaining balance (for the type step).
+  private async buildLeaveTypeOptions(employeeId: string): Promise<LeaveTypeOption[]> {
+    const types = await this.hrmsDbService.getLeaveTypes();
+    const bal = await this.hrmsDbService.getLeaveBalance(employeeId);
+    const balByTypeId = new Map<number, number>();
+    if (bal.initialised) {
+      for (const r of bal.rows) balByTypeId.set(r.leaveTypeId, r.closingBalance);
+    }
+    return types.map(t => ({
+      code: t.code,
+      name: t.name,
+      balance: balByTypeId.has(t.id) ? balByTypeId.get(t.id)! : null,
+    }));
   }
 
   status() {
@@ -770,8 +925,6 @@ export class ChatbotService {
         : 'Set GROQ_API_KEY or OPENAI_API_KEY in .env to enable AI responses',
     };
   }
-
-  // ── AI ────────────────────────────────────────────────────────────────────
 
   private async generateAIResponse(sanitizedMsg: string, user: Record<string, any>) {
     if (!this.aiClient) throw new Error('AI client not configured');
@@ -807,29 +960,19 @@ export class ChatbotService {
     return raw.replace(/\n?\s*Confidence:\s*(HIGH|MEDIUM|LOW)\.?\s*$/i, '').trim();
   }
 
-  // ── Rule-based ────────────────────────────────────────────────────────────
-
   private async generateResponse(message: string, user: Record<string, any>): Promise<string> {
     const employeeId = user.employeeId as string;
 
-    // Pull real basic-info from HRMSDEV
     const info = await this.hrmsDbService.getUserInfo(employeeId);
     const selfEmployee = info?.self ?? null;
 
-    // employees directory not wired to HRMSDEV yet — keep empty for now
     const employees: Record<string, any>[] = selfEmployee ? [selfEmployee] : [];
     const companyData = { holidays: info?.holidays ?? [], announcements: [] as { date: string; title: string }[] };
 
-    // Real leave-type catalogue from Mst_LeaveType (for the "leave policy" intent)
     const leaveTypes = await this.hrmsDbService.getLeaveTypes();
-
-    // Real department list from Mst_Department (for the "department" intent)
     const departments = await this.hrmsDbService.getDepartments();
-
-    // Real designations from Mst_Designation
     const designations = await this.hrmsDbService.getDesignations();
 
-    // Company-scoped data (resolved from the logged-in user's CompanyID)
     const companyId = (selfEmployee?.companyId as number) ?? null;
     const companyInfo = companyId ? await this.hrmsDbService.getCompanyInfo(companyId) : null;
     const branches    = companyId ? await this.hrmsDbService.getBranches(companyId) : [];
@@ -853,11 +996,15 @@ export class ChatbotService {
       directory,
     };
 
+    // Guided leave flow runs first if a draft is mid-flow.
+    const flowReply = await this.handleLeaveFlow(ctx);
+    if (flowReply !== null) return flowReply;
+
     for (const intent of this.intents) {
       if (intent.test(ctx)) return intent.handle(ctx);
     }
 
-    return `I didn't quite catch that. Try asking something like:\n- "How many leaves do I have left?"\n- "Apply CL for 15 June to 17 June"\n- "Cancel leave request LR-001"\n- "How do I download Form16?"`;
+    return `I didn't quite catch that. Try asking something like:\n- "How many leaves do I have left?"\n- "Apply leave"\n- "How do I download Form16?"`;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -874,13 +1021,11 @@ export class ChatbotService {
     return matrix[b.length][a.length];
   }
 
-  // Lightweight cleaner for intent keyword matching: collapse repeated chars, strip
-  // stray punctuation, apply the shared typo map. Keeps digits, letters, spaces, / and -.
   normalizeText(raw: string): string {
     let text = String(raw || '')
       .toLowerCase()
-      .replace(/(.)\1{2,}/g, '$1')       // leeeave → leave
-      .replace(/[^a-z0-9 \-\/]/g, ' ')  // strip stray punctuation
+      .replace(/(.)\1{2,}/g, '$1')
+      .replace(/[^a-z0-9 \-\/]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
     for (const [bad, good] of Object.entries(TYPO_MAP)) {
@@ -889,8 +1034,6 @@ export class ChatbotService {
     return text;
   }
 
-  // True if `keyword` is an exact substring of `text`, or any token of `text` (>=3 chars)
-  // is within Levenshtein distance 1 (short keywords <=4 chars) or 2 (longer keywords).
   fuzzyContains(text: string, keyword: string): boolean {
     if (text.includes(keyword)) return true;
     const threshold = keyword.length <= 4 ? 1 : 2;
@@ -931,7 +1074,7 @@ export class ChatbotService {
     return match ? match[0].toUpperCase() : null;
   }
 
-  private parseLeaveMessage(message: string): LeaveDraft | null {
+  private parseLeaveMessage(message: string): Omit<LeaveDraft, 'step'> | null {
     const normalized = String(message || '').trim();
     const lower = normalized.toLowerCase();
 
@@ -987,85 +1130,6 @@ export class ChatbotService {
     return null;
   }
 
-  private parseSpecificCancelDates(message: string): string[] | null {
-    const normalized = String(message || '').trim();
-    const monthNames: Record<string, string> = {
-      january:'01',february:'02',march:'03',april:'04',may:'05',june:'06',july:'07',august:'08',september:'09',october:'10',november:'11',december:'12',
-      jan:'01',feb:'02',mar:'03',apr:'04',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12',
-    };
-    const allMonths = Object.keys(monthNames).join('|');
-    const ord = '(?:st|nd|rd|th)?';
-
-    const makeDate = (day: string, monthStr: string, yearStr?: string): string | null => {
-      const month = monthNames[(monthStr || '').toLowerCase()];
-      if (!month) return null;
-      const year = parseInt(yearStr || '0') || new Date().getFullYear();
-      return `${year}-${month}-${String(parseInt(day)).padStart(2, '0')}`;
-    };
-
-    const rangeMatch = normalized.match(new RegExp(`(\\d{1,2})${ord}\\s*(?:to|-)\\s*(\\d{1,2})${ord}\\s+(${allMonths})\\s*(\\d{4})?`, 'i'));
-    if (rangeMatch) {
-      const month = monthNames[rangeMatch[3].toLowerCase()];
-      const year  = parseInt(rangeMatch[4] || '0') || new Date().getFullYear();
-      if (month) {
-        const dates: string[] = [];
-        for (let d = parseInt(rangeMatch[1]); d <= parseInt(rangeMatch[2]); d++) {
-          dates.push(`${year}-${month}-${String(d).padStart(2, '0')}`);
-        }
-        return dates.length ? dates : null;
-      }
-    }
-
-    const multiMatch = normalized.match(new RegExp(`(\\d{1,2})${ord}\\s*(?:and|,)\\s*(\\d{1,2})${ord}\\s+(${allMonths})\\s*(\\d{4})?`, 'i'));
-    if (multiMatch) {
-      const d1 = makeDate(multiMatch[1], multiMatch[3], multiMatch[4]);
-      const d2 = makeDate(multiMatch[2], multiMatch[3], multiMatch[4]);
-      const dates = [d1, d2].filter((v): v is string => v !== null).filter((v, i, a) => a.indexOf(v) === i);
-      return dates.length ? dates : null;
-    }
-
-    const twoMatch = normalized.match(new RegExp(`(\\d{1,2})${ord}\\s+(${allMonths})\\s*(\\d{4})?\\s*(?:and|,)\\s*(\\d{1,2})${ord}\\s+(${allMonths})\\s*(\\d{4})?`, 'i'));
-    if (twoMatch) {
-      const d1 = makeDate(twoMatch[1], twoMatch[2], twoMatch[3]);
-      const d2 = makeDate(twoMatch[4], twoMatch[5], twoMatch[6]);
-      const dates = [d1, d2].filter((v): v is string => v !== null).filter((v, i, a) => a.indexOf(v) === i);
-      return dates.length ? dates : null;
-    }
-
-    const singleMatch = normalized.match(new RegExp(`(\\d{1,2})${ord}\\s+(${allMonths})\\s*(\\d{4})?`, 'i'));
-    if (singleMatch) {
-      const d = makeDate(singleMatch[1], singleMatch[2], singleMatch[3]);
-      return d ? [d] : null;
-    }
-
-    return null;
-  }
-
-  private async findCancelableLeaveForEmployee(employeeId: string, inputText: string) {
-    const openRequests = (await this.hrmsDbService.getLeaveRequests(employeeId)).filter(r => ['pending', 'approved'].includes(r.status));
-    if (!openRequests.length) return null;
-
-    const requestCode = this.parseLeaveRequestCode(inputText);
-    if (requestCode) return openRequests.find(r => r.requestCode === requestCode) ?? null;
-
-    const date = this.parseLeaveDate(inputText);
-    if (date) {
-      const dateMatch = openRequests.find(r => {
-        if (r.startDate === date || r.endDate === date) return true;
-        if (r.startDate && r.endDate) {
-          const start  = new Date(r.startDate);
-          const end    = new Date(r.endDate);
-          const target = new Date(date);
-          return target >= start && target <= end;
-        }
-        return false;
-      });
-      if (dateMatch) return dateMatch;
-    }
-
-    return openRequests.length === 1 ? openRequests[0] : null;
-  }
-
   private async getLeaveBalanceSummary(
     employeeId: string,
     leaveTypes: { id: number; name: string; code: string; description: string; annualQuota: number | null }[],
@@ -1076,8 +1140,6 @@ export class ChatbotService {
       return `Your leave balance for ${new Date().getFullYear()} hasn't been set up yet. Please contact HR.`;
     }
 
-    // Map LeaveTypeId (1, 2, ...) → real name from the Mst_LeaveType catalogue.
-    // leaveTypes is ordered by ID, so index = id - 1 is a safe lookup here.
     const nameForId = (id: number): string => {
       const match = leaveTypes.find(t => t.id === id);
       return match ? match.name : `Leave type ${id}`;
@@ -1088,17 +1150,7 @@ export class ChatbotService {
       return `• ${name}: ${r.closingBalance} available (used ${r.availed} of ${r.openingBalance})`;
     });
 
-    return `Your leave balance for ${new Date().getFullYear()}:\n${lines.join('\n')}\n\nTip: Use the Leave Requests page to apply for or cancel leave.`;
-  }
-
-  private getRemainingDays(startDate: string, endDate: string, cancelledDates: string[]): string[] {
-    const cancelledSet = new Set(cancelledDates.map(d => new Date(d).toISOString().slice(0, 10)));
-    const remaining: string[] = [];
-    for (let d = new Date(startDate); d <= new Date(endDate); d.setDate(d.getDate() + 1)) {
-      const iso = d.toISOString().slice(0, 10);
-      if (!cancelledSet.has(iso)) remaining.push(new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'long' }));
-    }
-    return remaining;
+    return `Your leave balance for ${new Date().getFullYear()}:\n${lines.join('\n')}\n\nTip: Say "Apply leave" to apply.`;
   }
 
   private formatLeaveRange(startDate: string, endDate: string): string {
@@ -1109,7 +1161,6 @@ export class ChatbotService {
     return duration === 1 ? '1 day' : `${duration} days`;
   }
 
-  // Map a parsed leave code (CL, SL, EL, SICK, ...) to the real Mst_LeaveType ID.
   private resolveLeaveTypeId(
     code: string,
     leaveTypes: { id: number; code: string }[],
@@ -1137,7 +1188,7 @@ export class ChatbotService {
   }
 
   private getGeneralHelpGuide(userName: string): string {
-    return `Hi ${userName}. I can answer questions about the portal, company holidays, announcements, office policies, today's date, and more. You can also apply or cancel leave requests through me.`;
+    return `Hi ${userName}. I can answer questions about the portal, company holidays, announcements, office policies, today's date, and more. You can also apply for leave through me — just say "Apply leave".`;
   }
 
   private buildMenuGuide(title: string, steps: string[], footer = ''): string {
