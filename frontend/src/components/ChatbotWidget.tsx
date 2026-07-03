@@ -37,6 +37,24 @@ function getDefaultMessages(user: User | null): ChatMessage[] {
   ]
 }
 
+function formatTime(ts: Date | string): string {
+  const d = ts instanceof Date ? ts : new Date(ts)
+  if (isNaN(d.getTime())) return ''
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+// Heuristic: treat a bot message's buttons as a "menu" (card grid) when they
+// look like menu navigation rather than flow actions (Confirm/Cancel/Skip).
+function isMenuActions(actions: ChatAction[]): boolean {
+  if (!actions.length) return false
+  const flowLabels = ['confirm leave', 'cancel', 'skip']
+  const looksLikeFlow = actions.some(a => flowLabels.includes(a.label.toLowerCase()))
+  if (looksLikeFlow) return false
+  // Menu buttons either open submenus (send starts with "menu:") or are the
+  // known top-level/leaf menu entries.
+  return actions.some(a => a.send.startsWith('menu:')) || actions.length >= 3
+}
+
 export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: ChatbotWidgetProps) {
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const saved = loadWidgetMessages(user)
@@ -45,7 +63,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
   const [inputValue, setInputValue] = useState('')
   const [loading, setLoading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  // Tracks whether we've already auto-shown the main menu this session.
   const menuShownRef = useRef(false)
 
   useEffect(() => {
@@ -58,8 +75,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
     menuShownRef.current = false
   }, [user?.employeeId, user?.name])
 
-  // Auto-show the main menu the first time the chat is opened for a fresh session
-  // (i.e. only the welcome message is present).
   useEffect(() => {
     if (isOpen && !menuShownRef.current && messages.length <= 1 && accessToken) {
       menuShownRef.current = true
@@ -68,8 +83,6 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, accessToken])
 
-  // Shared send routine. `silent` omits the user bubble (used for menu:main so
-  // the command text doesn't show as if the user typed it).
   const sendText = async (text: string, opts?: { silent?: boolean }) => {
     const trimmed = text.trim()
     if (!trimmed || loading) return
@@ -161,51 +174,76 @@ export default function ChatbotWidget({ isOpen, onToggle, accessToken, user }: C
       {isOpen && (
         <div className="chatbot-widget">
           <div className="chatbot-header">
-            <h3>HRMS Assistant</h3>
-            <span className="user-role">{user?.role}</span>
+            <div className="chatbot-header-avatar">🤖</div>
+            <div className="chatbot-header-info">
+              <h3>HRMS Assistant</h3>
+              <span className="chatbot-header-status">Online</span>
+            </div>
+            <span className="chatbot-header-role">{user?.role}</span>
             <button className="close-btn" onClick={onToggle}>×</button>
           </div>
 
           <div className="chatbot-messages">
             {messages.map(msg => {
               const isLast = msg.id === lastMessageId
+              const actions = msg.actions ?? []
+              const menuMode = msg.sender === 'bot' && isMenuActions(actions)
+
               return (
                 <div key={msg.id} className={`message ${msg.sender}`}>
-                  <div className="message-bubble">{msg.text}</div>
+                  {msg.sender === 'bot' && <div className="msg-avatar">🤖</div>}
 
-                  {msg.sender === 'bot' && msg.actions && msg.actions.length > 0 && (
-                    <div className="message-actions">
-                      {msg.actions.map((action, i) => (
-                        <button
-                          key={i}
-                          type="button"
-                          className={`message-action-btn ${action.label.startsWith('←') || action.label.toLowerCase() === 'cancel' || action.label.toLowerCase() === 'skip' ? 'secondary' : ''}`}
-                          onClick={() => handleActionClick(action)}
-                          disabled={loading || !isLast}
-                        >
-                          {action.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                  <div className="msg-col">
+                    <div className="message-bubble">{msg.text}</div>
 
-                  {msg.sender === 'bot' && msg.widget && (
-                    <ChatWidgetRenderer
-                      widget={msg.widget}
-                      disabled={loading || !isLast}
-                      onSubmit={sendText}
-                    />
-                  )}
+                    {/* Buttons: menu grid or normal actions */}
+                    {msg.sender === 'bot' && actions.length > 0 && (
+                      <div className={`message-actions ${menuMode ? 'menu-grid' : ''}`}>
+                        {actions.map((action, i) => {
+                          const isBack = action.label.startsWith('←')
+                          const isSecondary =
+                            isBack ||
+                            action.label.toLowerCase() === 'cancel' ||
+                            action.label.toLowerCase() === 'skip'
+                          return (
+                            <button
+                              key={i}
+                              type="button"
+                              className={`message-action-btn ${isSecondary ? 'secondary' : ''} ${menuMode && isBack ? 'full' : ''}`}
+                              onClick={() => handleActionClick(action)}
+                              disabled={loading || !isLast}
+                            >
+                              {action.label}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )}
+
+                    {/* Interactive widget: date picker or leave-type cards */}
+                    {msg.sender === 'bot' && msg.widget && (
+                      <ChatWidgetRenderer
+                        widget={msg.widget}
+                        disabled={loading || !isLast}
+                        onSubmit={sendText}
+                      />
+                    )}
+
+                    <span className="msg-time">{formatTime(msg.timestamp)}</span>
+                  </div>
                 </div>
               )
             })}
 
             {loading && (
               <div className="message bot">
-                <div className="typing-dots">
-                  <span></span>
-                  <span></span>
-                  <span></span>
+                <div className="msg-avatar">🤖</div>
+                <div className="msg-col">
+                  <div className="typing-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
                 </div>
               </div>
             )}
@@ -289,7 +327,7 @@ function ChatWidgetRenderer({ widget, disabled, onSubmit }: ChatWidgetRendererPr
           >
             <span className="leave-type-name">{opt.name} ({opt.code})</span>
             <span className={`leave-type-balance ${opt.balance === null || opt.balance <= 0 ? 'zero' : ''}`}>
-              {opt.balance === null ? 'no balance set' : `${opt.balance} left`}
+              {opt.balance === null ? 'no balance' : `${opt.balance} left`}
             </span>
           </button>
         ))}

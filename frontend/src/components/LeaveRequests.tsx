@@ -16,8 +16,18 @@ interface LeaveFormData {
   reason: string;
 }
 
+interface LeaveStatusRow {
+  leaveId: number;
+  leaveType: string;
+  fromDate: string;
+  toDate: string;
+  appliedDate: string;
+  status: string;
+}
+
 export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps) {
   const [requests, setRequests] = useState<LeaveRequest[]>([])
+  const [allLeaves, setAllLeaves] = useState<LeaveStatusRow[]>([])
   const [loading, setLoading] = useState(true)
   const [submitLoading, setSubmitLoading] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
@@ -34,6 +44,7 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
 
   useEffect(() => {
     fetchRequests()
+    fetchAllLeaves()
   }, [accessToken, user?.role])
 
   const fetchRequests = async () => {
@@ -62,6 +73,20 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
     }
   }
 
+  // All of the user's leaves (any status, newest first, incl. pending) via
+  // USP_GetLeaveStatus. Complements the list below, which excludes pending.
+  const fetchAllLeaves = async () => {
+    if (!accessToken) return
+    try {
+      const response = await axios.get('/api/leaves/all', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
+      setAllLeaves(response.data.data ?? [])
+    } catch {
+      setAllLeaves([])
+    }
+  }
+
   const handleChange = (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     setFormData(prev => ({
       ...prev,
@@ -86,15 +111,14 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
       const response = await axios.post('/api/leaves', payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       })
-      // Backend now returns { success, statusCode, message, data }. Show the
-      // proc's own message (success or a 400/409 like "insufficient balance").
-      if (response.data.success) {
+      if (response.data.success === false) {
+        setError(response.data.message || 'Leave request could not be submitted.')
+      } else {
         setMessage(response.data.message || 'Leave request submitted successfully.')
         setFormData({ leaveType: 'CL', startDate: '', endDate: '', dayType: 'Full Day', reason: '' })
-      } else {
-        setError(response.data.message || 'Failed to submit leave request.')
       }
       fetchRequests()
+      fetchAllLeaves()
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         setError(err.response?.data?.message || 'Failed to submit leave request.')
@@ -114,8 +138,11 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
       const response = await axios.patch(`/api/leaves/${code}/approve`, {}, {
         headers: { Authorization: `Bearer ${accessToken}` }
       })
-      // Approve is stubbed for the demo; surface whatever message comes back.
-      setMessage(response.data.message || 'Done.')
+      if (response.data.success === false) {
+        setMessage(response.data.message || 'Approvals are not enabled yet.')
+      } else {
+        setMessage(`Leave request approved.`)
+      }
       fetchRequests()
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -135,8 +162,11 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
       const response = await axios.patch(`/api/leaves/${code}/cancel`, payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       })
-      // Cancel is stubbed for the demo; surface whatever message comes back.
-      setMessage(response.data.message || 'Done.')
+      if (response.data.success === false) {
+        setMessage(response.data.message || 'Cancellation is not available yet.')
+      } else {
+        setMessage(`Leave request cancelled.`)
+      }
       fetchRequests()
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -182,7 +212,7 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
           <button
             type="button"
             className="btn btn-secondary"
-            onClick={fetchRequests}
+            onClick={() => { fetchRequests(); fetchAllLeaves(); }}
             disabled={loading}
           >
             {loading ? 'Refreshing...' : 'Refresh Requests'}
@@ -192,6 +222,25 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
 
       {error && <div className="alert alert-error">{error}</div>}
       {message && <div className="alert alert-success">{message}</div>}
+
+      {/* All my leaves — every status, newest first, including pending
+          (the "My Leave Requests" list below excludes pending). */}
+      {allLeaves.length > 0 && (
+        <div className="latest-leave-panel">
+          <div className="latest-leave-head">
+            <span className="latest-leave-title">All My Leaves ({allLeaves.length})</span>
+          </div>
+          {allLeaves.map((l, i) => (
+            <div key={i} className="all-leave-row">
+              <span className="all-leave-main">
+                <strong>{l.leaveType}</strong>{' '}
+                {l.fromDate === l.toDate ? `on ${l.fromDate}` : `from ${l.fromDate} to ${l.toDate}`}
+              </span>
+              <span className={`status-badge status-${(l.status || '').toLowerCase()}`}>{l.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="leave-requests-grid">
         <section className="leave-form-panel">
@@ -264,7 +313,7 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
           {loading ? (
             <div className="loading-state">Loading requests…</div>
           ) : requests.length === 0 ? (
-            <div className="empty-state">No leave requests found.</div>
+            <div className="empty-state">No acted-on leave requests yet. See "All My Leaves" above for pending ones.</div>
           ) : (
             <div className="leave-cards">
               {requests.map(request => (
@@ -273,14 +322,17 @@ export default function LeaveRequests({ accessToken, user }: LeaveRequestsProps)
                     <strong>{request.requestCode}</strong>
                     <span className={`status-badge status-${request.status}`}>{request.status}</span>
                   </div>
-                  <p><strong>Employee ID:</strong> {request.employeeId}</p>
+                  {request.employeeId && <p><strong>Employee ID:</strong> {request.employeeId}</p>}
                   <p>
                     <strong>Leave:</strong> {request.leaveType}{' '}
-                    {request.startDate && request.endDate && request.startDate !== request.endDate
-                      ? `from ${request.startDate} to ${request.endDate} (${request.duration} days)`
-                      : `on ${request.startDate || request.leaveDate}`}
+                    {request.startDate && request.endDate
+                      ? (request.startDate === request.endDate
+                          ? `on ${request.startDate}`
+                          : `from ${request.startDate} to ${request.endDate}`)
+                      : 'dates on file'}
+                    {request.duration ? ` (${request.duration} day${request.duration === 1 ? '' : 's'})` : ''}
                   </p>
-                  <p><strong>Day:</strong> {request.dayType}</p>
+                  {request.dayType && <p><strong>Day:</strong> {request.dayType}</p>}
                   {request.reason && <p><strong>Reason:</strong> {request.reason}</p>}
                   <p className="meta-row">
                     {request.createdAt && <span>Created: {new Date(request.createdAt).toLocaleString()}</span>}

@@ -12,9 +12,6 @@ export class LeavesController {
     private readonly authService: AuthService,
   ) {}
 
-  // Read identity straight from the JWT. The token already carries employeeId,
-  // role and name (see AuthService.generateAccessToken), so there is no need to
-  // call findUserById -> usp_GetUserById (a dead trial proc that caused the 500).
   private getUserFromToken(authorization?: string):
     { employeeId: string; role: string; name: string } | null {
     const token = authorization?.split(' ')[1];
@@ -37,30 +34,36 @@ export class LeavesController {
     const user = this.getUserFromToken(authorization);
     if (!user) throw new UnauthorizedException('Missing or invalid auth token');
 
-    // USP_GetLeaveHistory is per-employee. There is no "all requests / pending
-    // queue" proc yet, so for the demo every role sees their own list.
     const history = await this.hrmsDbService.getLeaveHistory(user.employeeId);
 
-    // Map HRMSDEV history -> the exact fields LeaveRequests.tsx reads.
-    // status is lowercased so the component's `=== 'pending'` checks and its
-    // status-<x> CSS class both work.
     const data = history.map((h) => ({
       requestCode: String(h.leaveId),
       leaveId:     h.leaveId,
-      employeeId:  user.employeeId,       // list is this user's own; fills the blank label
+      employeeId:  user.employeeId,
       leaveType:   h.leaveType,
       startDate:   h.fromDate,
       endDate:     h.toDate,
-      leaveDate:   h.fromDate,            // single-day branch fallback
+      leaveDate:   h.fromDate,
       duration:    h.noOfDays,
-      dayType:     'Full Day',            // history proc has no day-type; sane default
+      dayType:     'Full Day',
       reason:      h.reason,
       status:      (h.status || '').toLowerCase(),
       statusId:    h.statusId,
-      createdAt:   h.appliedDate || null, // fixes "Invalid Date"
+      createdAt:   h.appliedDate || null,
     }));
 
     return { success: true, data };
+  }
+
+  // Latest leave (single most recent, any status incl. pending) via USP_GetLeaveStatus.
+  // Complements GET / (which shows acted-on leaves only, excluding pending).
+  @Get('all')
+  async getAllLeaves(@Headers('authorization') authorization?: string) {
+    const user = this.getUserFromToken(authorization);
+    if (!user) throw new UnauthorizedException('Missing or invalid auth token');
+
+    const leaves = await this.hrmsDbService.getLeaveStatus(user.employeeId);
+    return { success: true, data: leaves };
   }
 
   @Post()
@@ -71,12 +74,10 @@ export class LeavesController {
     const user = this.getUserFromToken(authorization);
     if (!user) throw new UnauthorizedException('Missing or invalid auth token');
 
-    // Tolerate whatever field names the form sends.
     const fromDate = body.fromDate ?? body.startDate ?? body.leaveDate;
     const toDate   = body.toDate   ?? body.endDate   ?? fromDate;
     const reason   = body.reason ?? null;
 
-    // Accept a numeric leaveTypeId OR a code like "CL" and resolve it.
     let leaveTypeId: number | null =
       body.leaveTypeId != null ? Number(body.leaveTypeId) : null;
 
@@ -93,14 +94,10 @@ export class LeavesController {
       );
     }
 
-    // createLeaveRequest returns { ok, statusCode, message } from the proc's
-    // own 200/400/404/409 response (insufficient balance, overlap, etc.).
     const result = await this.hrmsDbService.createLeaveRequest(user.employeeId, {
       leaveTypeId, fromDate, toDate, reason,
     });
 
-    // Return a `data` object too so the component's response.data.data access
-    // doesn't crash, and surface the proc's message.
     return {
       success: result.ok,
       statusCode: result.statusCode,
@@ -119,12 +116,10 @@ export class LeavesController {
     if (user.role !== 'hr' && user.role !== 'admin') {
       throw new UnauthorizedException('Not authorized to approve leave requests');
     }
-    // Phase 2 - not wired yet (needs USP_HierarchicalLeaveAction + an ApprovalId).
-    // Friendly response instead of hitting a dead proc.
     return {
       success: false,
       message: 'Approvals are not enabled in this demo yet.',
-      data: { requestCode: code },
+      data: { requestCode: code, message: 'Approvals are not enabled in this demo yet.' },
     };
   }
 
@@ -135,11 +130,10 @@ export class LeavesController {
   ) {
     const user = this.getUserFromToken(authorization);
     if (!user) throw new UnauthorizedException('Missing or invalid auth token');
-    // No withdrawal proc exists in HRMSDEV yet. Friendly response, not a 500.
     return {
       success: false,
       message: 'Leave cancellation is not available yet - please use the portal.',
-      data: { requestCode: code },
+      data: { requestCode: code, message: 'Leave cancellation is not available yet - please use the portal.' },
     };
   }
 }

@@ -21,31 +21,22 @@ const PERSONAL_INFO_KEYWORDS = [
 
 const LEAVE_ACTION_TRIGGERS = ['leave', 'cancel', 'confirm', 'apply', 'discard'];
 
-// Keywords that map to a known rule-based intent. Any message containing one of these
-// is answered locally instead of being sent to the LLM. (Edit here to extend.)
 const LOCAL_INTENT_KEYWORDS = [
-  // date / time
   'date', 'today', 'time', 'day',
-  // company info
   'holiday', 'holidays', 'vacation', 'festive', 'announcement', 'news', 'update',
   'policy', 'pto', 'procedure', 'wfh', 'work from home', 'remote',
-  // identity / help / greetings
   'who are you', 'what can you do', 'help', 'hello', 'hi', 'hey',
   'good morning', 'good afternoon', 'good evening', 'thank',
-  // office / facilities
   'office', 'cafe', 'canteen', 'lunch', 'food', 'parking', 'gym', 'wifi', 'internet',
   'vpn', 'transport', 'cab', 'dress code', 'attire', 'training', 'course',
   'office hours', 'working hours', 'timing', 'benefit', 'insurance', 'portal',
   'dashboard', 'department', 'team', 'attendance', 'probation', 'performance',
   'emergency', 'career', 'growth', 'it support', 'contact',
-  // self profile
   'details', 'profile', 'about me', 'basic info',
-  // menu
   'menu',
 ];
 
 const TYPO_MAP: Record<string, string> = {
-  // existing entries
   detials: 'details', detial: 'detail', detalis: 'details', detaails: 'details', detals: 'details',
   profil: 'profile', profle: 'profile', prafule: 'profile', profilee: 'profile',
   salery: 'salary', sallery: 'salary', salar: 'salary',
@@ -56,7 +47,6 @@ const TYPO_MAP: Record<string, string> = {
   cancl: 'cancel', cancelr: 'cancel', aproove: 'approve', approv: 'approve',
   leav: 'leave', leafe: 'leave', reuest: 'request', requst: 'request', requist: 'request',
   deteil: 'detail', emplyee: 'employee', employe: 'employee', employeess: 'employees', holidayes: 'holidays',
-  // extended HR terms
   balnce: 'balance', balence: 'balance', balanc: 'balance',
   salry: 'salary', slary: 'salary',
   payslp: 'payslip', payslipp: 'payslip', paislip: 'payslip',
@@ -69,13 +59,10 @@ const TYPO_MAP: Record<string, string> = {
   sik: 'sick', sck: 'sick',
 };
 
-const DRAFT_TTL_MS   = 30 * 60 * 1000; // 30 minutes
+const DRAFT_TTL_MS   = 30 * 60 * 1000;
 const DRAFT_MAX_SIZE = 500;
 
 // ── Menu system ───────────────────────────────────────────────────────────────
-// Each menu has a title and a list of buttons. A button either opens a submenu
-// (send: 'menu:<name>') or fires an existing command the intents already handle
-// (e.g. send: 'leave balance'). `hrOnly` buttons show only for HR/admin.
 interface MenuButton { label: string; send: string; hrOnly?: boolean }
 interface Menu { title: string; buttons: MenuButton[] }
 
@@ -96,6 +83,7 @@ const MENUS: Record<string, Menu> = {
       { label: 'Apply Leave',    send: 'apply leave' },
       { label: 'Leave Balance',  send: 'leave balance' },
       { label: 'Leave History',  send: 'my leaves' },
+      { label: 'Latest Leave',   send: 'latest leave' },
       { label: 'Cancel Leave',   send: 'cancel leave' },
       { label: '← Main Menu',    send: 'menu:main' },
     ],
@@ -132,7 +120,14 @@ const MENUS: Record<string, Menu> = {
 };
 
 // ── Draft types ───────────────────────────────────────────────────────────────
-type LeaveStep = 'awaiting_start' | 'awaiting_end' | 'awaiting_type' | 'awaiting_reason' | 'ready';
+type LeaveStep =
+  | 'awaiting_start'
+  | 'awaiting_end'
+  | 'awaiting_type'
+  | 'awaiting_dayChoice'
+  | 'awaiting_session'
+  | 'awaiting_reason'
+  | 'ready';
 
 interface LeaveDraft {
   leaveType: string;
@@ -143,6 +138,8 @@ interface LeaveDraft {
   dayType: string;
   reason: string;
   step: LeaveStep;
+  isHalfDay: boolean;
+  session: string;   // 'FirstHalf' | 'SecondHalf' | ''
 }
 
 interface PartialCancelDraft {
@@ -206,8 +203,6 @@ export class ChatbotService {
   private readonly partialCancelDrafts  = new Map<string, Stamped<PartialCancelDraft>>();
   private readonly cancelChoiceDrafts   = new Map<string, Stamped<CancelChoiceDraft>>();
 
-  // Tracks the last menu opened per employee, so buildResponseExtras can attach
-  // that menu's buttons to the reply. Cleared once consumed.
   private readonly pendingMenu = new Map<string, string>();
 
   private readonly intents: Array<{
@@ -215,23 +210,19 @@ export class ChatbotService {
     test:   (ctx: IntentCtx) => boolean;
     handle: (ctx: IntentCtx) => Promise<string>;
   }> = [
-    // ── Menu navigation ───────────────────────────────────────────────────────
     {
       name: 'menu',
       test: (ctx) =>
         /(^|\s)menu:/i.test(ctx.message) || ctx.msg === 'menu' || ctx.msg === 'main menu',
       handle: async (ctx) => {
-        // Extract the menu name from "menu:leave"; bare "menu" opens main.
         const m = ctx.message.match(/menu:\s*([a-z]+)/i);
         const key = m ? m[1].toLowerCase() : 'main';
         const menu = MENUS[key] ?? MENUS.main;
-        // Remember which menu to render buttons for (consumed in buildResponseExtras).
         this.pendingMenu.set(ctx.employeeId, MENUS[key] ? key : 'main');
         return menu.title;
       },
     },
 
-    // ── Discard an in-progress leave draft (fired by the Cancel button) ───────
     {
       name: 'discardDraft',
       test: (ctx) =>
@@ -246,7 +237,6 @@ export class ChatbotService {
       },
     },
 
-    // ── Start the guided apply-leave flow ─────────────────────────────────────
     {
       name: 'applyLeave',
       test: (ctx) =>
@@ -257,6 +247,7 @@ export class ChatbotService {
         this.setDraft(this.leaveDrafts, ctx.employeeId, {
           leaveType: '', leaveDate: '', startDate: '', endDate: '',
           duration: 0, dayType: 'Full Day', reason: '', step: 'awaiting_start',
+          isHalfDay: false, session: '',
         });
         return `Let's apply for leave. First, please pick your leave start date below.`;
       },
@@ -343,18 +334,37 @@ export class ChatbotService {
         ctx.msg.includes('my leave applications') || ctx.msg.includes('leave status') ||
         ctx.msg.includes('my applications') || ctx.msg === 'history' ||
         ctx.msg.includes('leave requests') || ctx.msg.includes('pending request') ||
-        ctx.msg.includes('pending requests') || ctx.msg.includes('pending leave') ||
-        ctx.msg.includes('my requests') || ctx.msg.includes('applied leaves') ||
-        ctx.msg.includes('leave applications'),
+        ctx.msg.includes('pending requests') || ctx.msg.includes('my requests') ||
+        ctx.msg.includes('applied leaves') || ctx.msg.includes('leave applications'),
       handle: async (ctx) => {
         const history = await this.hrmsDbService.getLeaveHistory(ctx.employeeId);
         if (!history.length) {
-          return `You have no leave requests on record. To apply, say "Apply leave".`;
+          return `You have no acted-on leave requests yet (approved/rejected). To see your most recent leave including pending ones, tap "Latest Leave". To apply, say "Apply leave".`;
         }
         const lines = history.map((h, i) =>
           `${i + 1}. ${h.leaveType} — ${this.formatLeaveRange(h.fromDate, h.toDate)} (${this.formatDayCount(h.noOfDays)}) — ${h.status}`,
         );
         return `Your leave requests:\n${lines.join('\n')}`;
+      },
+    },
+
+    {
+      name: 'latestLeave',
+      test: (ctx) =>
+        ctx.msg.includes('latest leave') || ctx.msg.includes('recent leave') ||
+        ctx.msg.includes('my latest leave') || ctx.msg.includes('last leave') ||
+        ctx.msg.includes('leave status check') || ctx.msg.includes('status of my leave') ||
+        ctx.msg.includes('latest status'),
+      handle: async (ctx) => {
+        const leaves = await this.hrmsDbService.getLeaveStatus(ctx.employeeId);
+        if (!leaves.length) {
+          return `You don't have any leave requests on record yet. Say "Apply leave" to create one.`;
+        }
+        const lines = leaves.map((l, i) => {
+          const range = l.fromDate === l.toDate ? l.fromDate : `${l.fromDate} to ${l.toDate}`;
+          return `${i + 1}. ${l.leaveType} — ${range} — ${l.status}`;
+        });
+        return `All your leave requests (newest first):\n${lines.join('\n')}`;
       },
     },
 
@@ -410,11 +420,15 @@ export class ChatbotService {
           fromDate: draft.startDate,
           toDate: draft.endDate,
           reason: draft.reason || null,
+          isHalfDay: draft.isHalfDay,
+          sessionFrom: draft.isHalfDay ? draft.session : null,
+          sessionTo:   draft.isHalfDay ? draft.session : null,
         });
         this.deleteDraft(this.leaveDrafts, ctx.employeeId);
         if (result.ok) {
           const rangeText = this.formatLeaveRange(draft.startDate, draft.endDate);
-          return `${result.message}\n- Type: ${draft.leaveType}\n- Dates: ${rangeText}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nUse "my leaves" to see all your leave requests.`;
+          const dayText = draft.isHalfDay ? `Half day (${this.sessionLabel(draft.session)})` : 'Full day';
+          return `${result.message}\n- Type: ${draft.leaveType}\n- Dates: ${rangeText}\n- Day: ${dayText}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nTap "Latest Leave" to see its status.`;
         }
         return result.message;
       },
@@ -428,7 +442,7 @@ export class ChatbotService {
         this.parseLeaveMessage(ctx.message) !== null,
       handle: async (ctx) => {
         const parsed = this.parseLeaveMessage(ctx.message)!;
-        this.setDraft(this.leaveDrafts, ctx.employeeId, { ...parsed, step: 'ready' });
+        this.setDraft(this.leaveDrafts, ctx.employeeId, { ...parsed, step: 'ready', isHalfDay: false, session: '' });
         const rangeText    = this.formatLeaveRange(parsed.startDate, parsed.endDate);
         const durationText = this.formatDayCount(parsed.duration);
         return `Great! I found your leave details:\n- Type: ${parsed.leaveType}\n- Dates: ${rangeText} (${durationText})\n- Day type: ${parsed.dayType}${parsed.reason ? `\n- Reason: ${parsed.reason}` : ''}\n\nTap "Confirm Leave" to submit, or "Cancel" to discard.`;
@@ -453,7 +467,7 @@ export class ChatbotService {
       handle: async (ctx) => {
         const history = await this.hrmsDbService.getLeaveHistory(ctx.employeeId);
         if (!history.length) {
-          return `You have no leave requests on record.`;
+          return `You have no acted-on leave requests on record.`;
         }
         const lines = history.map((h, i) =>
           `${i + 1}. ${h.leaveType} — ${this.formatLeaveRange(h.fromDate, h.toDate)} (${this.formatDayCount(h.noOfDays)}) — ${h.status}`,
@@ -465,7 +479,7 @@ export class ChatbotService {
     {
       name: 'approveLeave',
       test: (ctx) =>
-        ctx.msg.includes('approve leave') || ctx.msg.includes('pending leave') ||
+        ctx.msg.includes('approve leave') || ctx.msg.includes('pending approval') ||
         ctx.msg.includes('leave approval') || ctx.msg.includes('accept leave'),
       handle: async (ctx) =>
         (ctx.role === 'admin' || ctx.role === 'hr')
@@ -627,7 +641,7 @@ export class ChatbotService {
       name: 'announcements',
       test: (ctx) =>
         ctx.msg.includes('announcement') || ctx.msg.includes('news') ||
-        ctx.msg.includes('latest') || ctx.msg.includes('update'),
+        ctx.msg.includes('latest news') || ctx.msg.includes('update'),
       handle: async (ctx) =>
         ctx.companyData.announcements.length > 0
           ? `Latest announcements:\n${ctx.companyData.announcements.slice(0, 2).map(a => `• ${a.date}: ${a.title}`).join('\n')}`
@@ -723,8 +737,6 @@ export class ChatbotService {
     }
   }
 
-  // ── Draft TTL helpers ─────────────────────────────────────────────────────
-
   private getDraft<T>(map: Map<string, Stamped<T>>, key: string): T | undefined {
     const entry = map.get(key);
     if (!entry) return undefined;
@@ -752,7 +764,12 @@ export class ChatbotService {
     return this.hasDraft(this.leaveDrafts, employeeId);
   }
 
-  // ── Guided apply-leave flow ────────────────────────────────────────────────
+  private sessionLabel(session: string): string {
+    if (session === 'FirstHalf') return 'First Half';
+    if (session === 'SecondHalf') return 'Second Half';
+    return session;
+  }
+
   private async handleLeaveFlow(ctx: IntentCtx): Promise<string | null> {
     const draft = this.getDraft(this.leaveDrafts, ctx.employeeId);
     if (!draft) return null;
@@ -789,10 +806,66 @@ export class ChatbotService {
     if (draft.step === 'awaiting_type') {
       const code = this.extractLeaveTypeCode(ctx.message, ctx.leaveTypes);
       if (!code) return `Please choose a leave type from the buttons below.`;
+
+      // Sick Leave: the proc requires a document only for MORE than 1 day.
+      // So a single-day Sick Leave is fine via chat; multi-day must use the portal.
+      const picked = ctx.leaveTypes.find(t => (t.code ?? '').toUpperCase() === code);
+      const isSickLeave =
+        (picked?.name ?? '').toLowerCase().includes('sick') || code === 'SL';
+      const isSingleDay = draft.startDate === draft.endDate;
+      if (isSickLeave && !isSingleDay) {
+        return `Sick Leave for more than one day needs a supporting document, which I can't attach here. Please apply multi-day Sick Leave from the Leave Requests page in the portal.\n\nFor a single-day Sick Leave, pick a single date and choose Sick Leave again — or pick a different leave type from the buttons above.`;
+      }
+
       draft.leaveType = code;
+
+      // Half-day only makes sense for a single day. For multi-day ranges, skip the
+      // day-choice question and go straight to reason.
+      if (isSingleDay) {
+        draft.step = 'awaiting_dayChoice';
+        this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+        return `Leave type set to ${code}. Is this a full day or a half day?`;
+      }
+
       draft.step = 'awaiting_reason';
       this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
       return `Leave type set to ${code}. Finally, add a reason (or tap Skip).`;
+    }
+
+    if (draft.step === 'awaiting_dayChoice') {
+      const m = ctx.msg;
+      const choseHalf = m.includes('half');
+      const choseFull = m.includes('full');
+      if (!choseHalf && !choseFull) {
+        return `Please tap "Full Day" or "Half Day".`;
+      }
+      if (choseFull) {
+        draft.isHalfDay = false;
+        draft.dayType = 'Full Day';
+        draft.step = 'awaiting_reason';
+        this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+        return `Full day it is. Finally, add a reason (or tap Skip).`;
+      }
+      // half day → ask session
+      draft.isHalfDay = true;
+      draft.dayType = 'Half Day';
+      draft.step = 'awaiting_session';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      return `Half day — which session?`;
+    }
+
+    if (draft.step === 'awaiting_session') {
+      // Accept "session:FirstHalf"/"session:SecondHalf" from buttons, or text.
+      const raw = ctx.message.toLowerCase();
+      let session = '';
+      if (raw.includes('firsthalf') || raw.includes('first half') || raw.includes('first')) session = 'FirstHalf';
+      else if (raw.includes('secondhalf') || raw.includes('second half') || raw.includes('second')) session = 'SecondHalf';
+      if (!session) return `Please tap "First Half" or "Second Half".`;
+
+      draft.session = session;
+      draft.step = 'awaiting_reason';
+      this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
+      return `${this.sessionLabel(session)} half day. Finally, add a reason (or tap Skip).`;
     }
 
     if (draft.step === 'awaiting_reason') {
@@ -801,7 +874,9 @@ export class ChatbotService {
       draft.step = 'ready';
       this.setDraft(this.leaveDrafts, ctx.employeeId, draft);
       const rangeText = this.formatLeaveRange(draft.startDate, draft.endDate);
-      return `Here's your leave request:\n- Type: ${draft.leaveType}\n- Dates: ${rangeText} (${this.formatDayCount(draft.duration)})\n- Day type: ${draft.dayType}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nTap "Confirm Leave" to submit, or "Cancel" to discard.`;
+      const dayText = draft.isHalfDay ? `Half day (${this.sessionLabel(draft.session)})` : 'Full day';
+      const durationText = draft.isHalfDay ? '0.5 day' : this.formatDayCount(draft.duration);
+      return `Here's your leave request:\n- Type: ${draft.leaveType}\n- Dates: ${rangeText} (${durationText})\n- Day: ${dayText}${draft.reason ? `\n- Reason: ${draft.reason}` : ''}\n\nTap "Confirm Leave" to submit, or "Cancel" to discard.`;
     }
 
     return null;
@@ -823,14 +898,11 @@ export class ChatbotService {
     return match ? match.code.toUpperCase() : null;
   }
 
-  // ── Routing ───────────────────────────────────────────────────────────────
-
   classifyRoute(message: string, user: Record<string, any>): { useLocal: boolean; reason: string } {
     const employeeId: string = user?.employeeId ?? '';
     const rawMsg = message.toLowerCase();
     const msg = this.normalizeMessage(message);
 
-    // Menu commands are always local.
     if (/(^|\s)menu:/i.test(message) || msg === 'menu' || msg === 'main menu') {
       return { useLocal: true, reason: 'menu' };
     }
@@ -872,8 +944,6 @@ export class ChatbotService {
 
     return { useLocal: false, reason: 'safe_for_ai' };
   }
-
-  // ── Public API ────────────────────────────────────────────────────────────
 
   async chat(message: string, userPayload?: Record<string, any>) {
     if (!message?.trim()) throw new BadRequestException('message is required');
@@ -931,13 +1001,10 @@ export class ChatbotService {
     }
   }
 
-  // Build the buttons + widget to attach to the current reply.
-  // Priority: a just-opened menu > the guided-flow step.
   private async buildResponseExtras(
     employeeId: string,
     role: string,
   ): Promise<{ actions: ActionButton[]; widget: ResponseWidget | null }> {
-    // 1) If a menu was just opened, attach its buttons (role-filtered).
     const menuKey = this.pendingMenu.get(employeeId);
     if (menuKey) {
       this.pendingMenu.delete(employeeId);
@@ -951,7 +1018,6 @@ export class ChatbotService {
       }
     }
 
-    // 2) Otherwise fall back to the guided-flow step.
     const draft = this.getDraft(this.leaveDrafts, employeeId);
     if (!draft) return { actions: [], widget: null };
 
@@ -964,6 +1030,24 @@ export class ChatbotService {
     if (draft.step === 'awaiting_type') {
       const options = await this.buildLeaveTypeOptions(employeeId);
       return { actions: [], widget: { type: 'leaveTypes', step: 'type', options } };
+    }
+    if (draft.step === 'awaiting_dayChoice') {
+      return {
+        actions: [
+          { label: 'Full Day', send: 'full day' },
+          { label: 'Half Day', send: 'half day' },
+        ],
+        widget: null,
+      };
+    }
+    if (draft.step === 'awaiting_session') {
+      return {
+        actions: [
+          { label: 'First Half',  send: 'session:FirstHalf' },
+          { label: 'Second Half', send: 'session:SecondHalf' },
+        ],
+        widget: null,
+      };
     }
     if (draft.step === 'awaiting_reason') {
       return { actions: [{ label: 'Skip', send: 'skip' }], widget: null };
@@ -994,7 +1078,6 @@ export class ChatbotService {
     }));
   }
 
-  // Expose the main menu buttons for the frontend's opening menu (role-filtered).
   getMainMenu(role: string): { title: string; actions: ActionButton[] } {
     const isPrivileged = role === 'admin' || role === 'hr';
     const actions = MENUS.main.buttons
@@ -1093,10 +1176,8 @@ export class ChatbotService {
       if (intent.test(ctx)) return intent.handle(ctx);
     }
 
-    return `I didn't quite catch that. Try the ☰ Menu button, or ask something like:\n- "How many leaves do I have left?"\n- "Apply leave"\n- "How do I download Form16?"`;
+    return `I didn't quite catch that. Try the ☰ Menu button, or ask something like:\n- "How many leaves do I have left?"\n- "Apply leave"\n- "Latest leave"\n- "How do I download Form16?"`;
   }
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
 
   private levenshteinDistance(a: string, b: string): number {
     const matrix = Array.from({ length: b.length + 1 }, (_, i) => [i]);
@@ -1143,6 +1224,7 @@ export class ChatbotService {
       'tax', 'form16', 'employee', 'employees', 'my', 'me', 'all', 'holidays', 'holiday',
       'department', 'designation', 'training', 'document', 'documents', 'company', 'policy',
       'policies', 'office', 'benefits', 'attendance', 'manager', 'hr', 'admin', 'team', 'email', 'contact',
+      'latest', 'recent', 'status', 'half', 'full', 'session',
     ])];
 
     const tokens = normalized.split(/\s+/).map(token => {
@@ -1163,7 +1245,7 @@ export class ChatbotService {
     return match ? match[0].toUpperCase() : null;
   }
 
-  private parseLeaveMessage(message: string): Omit<LeaveDraft, 'step'> | null {
+  private parseLeaveMessage(message: string): Omit<LeaveDraft, 'step' | 'isHalfDay' | 'session'> | null {
     const normalized = String(message || '').trim();
     const lower = normalized.toLowerCase();
 

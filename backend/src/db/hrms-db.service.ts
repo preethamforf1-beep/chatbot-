@@ -23,14 +23,9 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: real basic-info via USP_GetUserInfo ────────────────────────────
-  // Maps THEIR procedure's columns to the shape the chatbot already expects
-  // (selfEmployee: { id, name, department, designation, ... } + holidays).
   async getUserInfo(employeeId: string) {
     const pool = await this.getPool();
 
-    // USP_GetUserInfo RAISERRORs if the employee isn't found / inactive. Catch it so a
-    // single bad lookup degrades gracefully (returns null) instead of crashing the
-    // whole chatbot response.
     let result: sql.IProcedureResult<any>;
     try {
       result = await pool.request()
@@ -41,8 +36,6 @@ export class HrmsDbService {
       return null;
     }
 
-    // USP_GetUserInfo returns 3 result sets:
-    //   [0] profile, [1] menus (ignored for now), [2] holidays
     const profileRow  = result.recordsets[0]?.[0];
     const holidayRows  = (result.recordsets[2] as any[]) ?? [];
 
@@ -68,7 +61,6 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: fetch user by email for login (USP_Validateuser) ────────────────
-  // Returns the raw row including PasswordHash; AuthService does the bcrypt.compare.
   async validateUser(email: string) {
     const pool = await this.getPool();
     const result = await pool.request()
@@ -79,8 +71,6 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: real leave-type catalogue from Mst_LeaveType ────────────────────
-  // The master list of all leave types (CL, SL, EL, ...) with their annual quota.
-  // Used by the chatbot's "leave policy" intent instead of hardcoded text.
   async getLeaveTypes() {
     const pool = await this.getPool();
     try {
@@ -181,7 +171,6 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: active employee directory for the logged-in user's company ───────
-  // Active only (Deleted = 0 AND EmploymentStatusID = 1), scoped to the company.
   async getEmployeeDirectory(companyId: number) {
     const pool = await this.getPool();
     try {
@@ -345,19 +334,34 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: apply leave via USP_LeaveRequestSubmission ──────────────────────
-  // Expects a real LeaveTypeId (number) + FromDate/ToDate. Returns { ok, message }.
+  // The proc now takes 9 params (half-day + document support added by the team).
+  // Full-day is the default: isHalfDay=0, sessions null, documentPath null.
+  // Returns { ok, statusCode, message } from the proc's own 200/400/404/409/500 response.
   async createLeaveRequest(
     employeeId: string,
-    body: { leaveTypeId: number; fromDate: string; toDate: string; reason?: string | null },
+    body: {
+      leaveTypeId: number;
+      fromDate: string;
+      toDate: string;
+      reason?: string | null;
+      isHalfDay?: boolean;
+      sessionFrom?: string | null;
+      sessionTo?: string | null;
+      documentPath?: string | null;
+    },
   ): Promise<{ ok: boolean; statusCode: number; message: string }> {
     const pool = await this.getPool();
     try {
       const result = await pool.request()
-        .input('EmployeeId',  sql.VarChar,   employeeId)
-        .input('LeaveTypeId', sql.Int,       body.leaveTypeId)
-        .input('FromDate',    sql.Date,      body.fromDate)
-        .input('ToDate',      sql.Date,      body.toDate)
-        .input('Reason',      sql.NVarChar,  body.reason ?? null)
+        .input('EmployeeId',   sql.VarChar,   employeeId)
+        .input('LeaveTypeId',  sql.Int,       body.leaveTypeId)
+        .input('FromDate',     sql.Date,      body.fromDate)
+        .input('ToDate',       sql.Date,      body.toDate)
+        .input('SessionFrom',  sql.VarChar,   body.sessionFrom ?? null)
+        .input('SessionTo',    sql.VarChar,   body.sessionTo ?? null)
+        .input('IsHalfDay',    sql.Bit,       body.isHalfDay ? 1 : 0)
+        .input('Reason',       sql.NVarChar,  body.reason ?? null)
+        .input('DocumentPath', sql.NVarChar,  body.documentPath ?? null)
         .execute('USP_LeaveRequestSubmission');
 
       const row = result.recordset?.[0] ?? {};
@@ -371,7 +375,8 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: a user's leave history via USP_GetLeaveHistory ──────────────────
-  // Returns the list of the employee's leave applications (with real LeaveId + status).
+  // NOTE: this proc returns ACTED-ON leaves only (StatusId 4,5,6,13) and excludes
+  // Pending (3). For the latest pending/most-recent leave, use getLeaveStatus below.
   async getLeaveHistory(employeeId: string) {
     const pool = await this.getPool();
     try {
@@ -380,7 +385,6 @@ export class HrmsDbService {
         .execute('USP_GetLeaveHistory');
 
       const rows = result.recordset ?? [];
-      // Error/empty shape returns a StatusCode column instead of leave rows.
       if (!rows.length || rows[0].StatusCode !== undefined) {
         return [];
       }
@@ -394,16 +398,52 @@ export class HrmsDbService {
       return rows.map((r: any) => ({
         leaveId:   Number(r.LeaveId),
         leaveType: r.LeaveTypeName as string,
-        fromDate:  toDateStr(r.FromDate),
-        toDate:    toDateStr(r.ToDate),
+        fromDate:  String(r.FromDate ?? ''),   // proc already returns dd-MM-yyyy
+        toDate:    String(r.ToDate ?? ''),     // pass through, don't re-parse
         noOfDays:  Number(r.NoOfDays ?? 0),
         reason:    (r.Reason ?? '') as string,
         statusId:  Number(r.StatusId),
         status:    r.Status as string,
-        appliedDate: toDateStr(r.AppliedDate),
+        appliedDate: toDateStr(r.AppliedDate),  // AppliedDate is a real datetime, keep parsing
       }));
     } catch (err) {
       console.error('getLeaveHistory failed for', employeeId, '-', (err as Error).message);
+      return [];
+    }
+  }
+
+  // ─── HRMSDEV: latest leave status via USP_GetLeaveStatus ──────────────────────
+  // Returns only the SINGLE most recent leave (proc uses TOP 1), any status.
+  // Used for a "what happened to my latest leave?" check — complements history
+  // (which shows acted-on leaves only and excludes pending).
+async getLeaveStatus(employeeId: string) {
+    const pool = await this.getPool();
+    try {
+      const result = await pool.request()
+        .input('EmployeeId', sql.VarChar, employeeId)
+        .execute('USP_GetLeaveStatus');
+
+      const rows = result.recordset ?? [];
+      if (!rows.length || rows[0].StatusCode !== undefined) {
+        return [];
+      }
+
+      const toDateStr = (v: unknown) => {
+        if (!v) return '';
+        const d = v instanceof Date ? v : new Date(String(v));
+        return isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10);
+      };
+
+      return rows.map((r: any) => ({
+        leaveId:     Number(r.LeaveId),
+        leaveType:   r.Name as string,
+        fromDate:    String(r.FromDate ?? ''),
+        toDate:      String(r.ToDate ?? ''),
+        appliedDate: toDateStr(r.AppliedDate),
+        status:      r.Status as string,
+      }));
+    } catch (err) {
+      console.error('getLeaveStatus failed for', employeeId, '-', (err as Error).message);
       return [];
     }
   }
@@ -472,11 +512,6 @@ export class HrmsDbService {
   }
 
   // ─── HRMSDEV: real leave balance via USP_EmployeeLeaveBalance ─────────────────
-  // Returns one of two shapes:
-  //   success → rows: { LeaveTypeId, OpeningBalance, Availed, ClosingBalance, ... }
-  //   error   → single row: { StatusCode, Message }   (e.g. 404 not initialised)
-  // We return { initialised, rows[] }. rows carry leaveTypeId so the chatbot can map
-  // it to the real leave-type name from Mst_LeaveType.
   async getLeaveBalance(employeeId: string) {
     const pool = await this.getPool();
     let result: sql.IProcedureResult<any>;
@@ -490,7 +525,6 @@ export class HrmsDbService {
     }
 
     const rows = result.recordset ?? [];
-    // The error/empty shape returns a StatusCode column instead of balance data.
     if (!rows.length || rows[0].StatusCode !== undefined) {
       return { initialised: false, rows: [] as any[] };
     }

@@ -12,7 +12,7 @@ function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [accessToken, setAccessToken] = useState<string | null>(null)
   const [user, setUser] = useState<User | null>(null)
-  const [currentPage, setCurrentPage] = useState('dashboard')
+  const [currentPage, setCurrentPage] = useState('leaves')
   const [serverStatus, setServerStatus] = useState<string | null>(null)
   const [chatbotOpen, setChatbotOpen] = useState(false)
 
@@ -62,7 +62,7 @@ function App() {
     setAccessToken(null)
     setUser(null)
     setIsLoggedIn(false)
-    setCurrentPage('dashboard')
+    setCurrentPage('leaves')
     alert('Logged out successfully! Please login again.')
   }
 
@@ -93,18 +93,8 @@ function App() {
             {user && <p className="user-name">Welcome, {user.name}! 👋</p>}
           </div>
           <nav className="nav">
-            <button
-              className={`nav-link ${currentPage === 'dashboard' ? 'active' : ''}`}
-              onClick={() => setCurrentPage('dashboard')}
-            >
-              Dashboard
-            </button>
-            <button
-              className={`nav-link ${currentPage === 'employees' ? 'active' : ''}`}
-              onClick={() => setCurrentPage('employees')}
-            >
-              Employees
-            </button>
+            
+         
             <button
               className={`nav-link ${currentPage === 'leaves' ? 'active' : ''}`}
               onClick={() => setCurrentPage('leaves')}
@@ -112,6 +102,8 @@ function App() {
               Leave Requests
             </button>
             <a href="#resources" className="nav-link">Resources</a>
+            <a href="#resources" className="nav-link">Dashboard</a>
+            <a href="#resources" className="nav-link">employees</a>
             <a href="#support" className="nav-link">Support</a>
             <button className="logout-btn" onClick={handleLogout}>
               Logout
